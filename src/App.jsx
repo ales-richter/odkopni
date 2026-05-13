@@ -501,6 +501,12 @@ function RecoverAccount({onBack,onDone}){
     }
     setSearching(true);setError("");
     try{
+      // Před čtením chatů musíme být přihlášení (chats read vyžadují request.auth != null).
+      // Krátkodobá anonymní session — bude zahozená až uživatel klikne v emailu v Chromu.
+      if(!auth.currentUser){
+        await signInAnonymously(auth);
+      }
+
       // 1) Najít všechny profily s odpovídající přezdívkou (case-insensitive musíme udělat klientsky)
       var profSnap = await getDocs(collection(db,"profiles"));
       var candidates = [];

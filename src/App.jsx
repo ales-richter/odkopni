@@ -446,11 +446,305 @@ function ChatList({user,onOpen,onBack}){
     </div>);
 }
 
-// ── Welcome Screen (with optional demand + Google login) ──
+// ── Detekce FB / Instagram in-app browseru ──
+function isInAppBrowser(){
+  if(typeof navigator==="undefined") return false;
+  var ua = navigator.userAgent || "";
+  // FB: FBAN/FBAV/FB_IAB, Instagram: Instagram, Messenger: Messenger
+  return /FBAN|FBAV|FB_IAB|FB4A|Instagram|Messenger/i.test(ua);
+}
+
+// ── Banner pro in-app browser ──
+function InAppBrowserBanner(){
+  const [dismissed,setDismissed]=useState(function(){try{return sessionStorage.getItem("odkopni_iab_banner_dismissed")==="1";}catch(e){return false;}});
+  if(!isInAppBrowser()||dismissed) return null;
+  function dismiss(){setDismissed(true);try{sessionStorage.setItem("odkopni_iab_banner_dismissed","1");}catch(e){}}
+  return(
+    <div style={{background:"linear-gradient(135deg, #d45a5a, #c44a4a)",color:"white",padding:"12px 16px",fontSize:"13px",lineHeight:"1.45",position:"sticky",top:0,zIndex:200,boxShadow:"0 2px 8px rgba(0,0,0,0.15)"}}>
+      <div style={{maxWidth:"960px",margin:"0 auto",display:"flex",alignItems:"flex-start",gap:"12px"}}>
+        <div style={{fontSize:"22px",flexShrink:0,lineHeight:"1"}}>⚠️</div>
+        <div style={{flex:1}}>
+          <div style={{fontWeight:"700",marginBottom:"4px"}}>Otevřete v běžném prohlížeči</div>
+          <div style={{opacity:0.95,fontSize:"12.5px"}}>Aktuálně jste ve vestavěném prohlížeči Facebooku. Pro <strong>uchování vašich inzerátů a zpráv</strong> doporučujeme appku otevřít v <strong>Chrome, Safari</strong> nebo jiném prohlížeči vašeho telefonu (klepněte na ⋮ nebo ⋯ nahoře → „Otevřít v prohlížeči").</div>
+        </div>
+        <button onClick={dismiss} aria-label="Zavřít" style={{background:"rgba(255,255,255,0.2)",border:"none",borderRadius:"50%",width:"24px",height:"24px",color:"white",cursor:"pointer",fontSize:"14px",fontWeight:"700",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+      </div>
+    </div>);
+}
+
+// ── Recovery účtu — vyhledá starý profil a převede ho na aktuální session ──
+function RecoverAccount({onBack,onDone}){
+  const [step,setStep]=useState(1); // 1=zadej údaje, 2=potvrď, 3=migrace, 4=hotovo
+  const [name,setName]=useState("");
+  const [loc,setLoc]=useState("");
+  const [plant,setPlant]=useState("");
+  const [searching,setSearching]=useState(false);
+  const [found,setFound]=useState(null); // {profile, profileId, plants, chats}
+  const [error,setError]=useState("");
+  const [progress,setProgress]=useState({phase:"",done:0,total:0});
+
+  function norm(s){return (s||"").trim().toLowerCase();}
+
+  async function searchProfile(){
+    if(!name.trim()||!loc.trim()||!plant.trim()||searching) return;
+    setSearching(true);setError("");
+    try{
+      // 1) Najít všechny profily s odpovídající přezdívkou (case-insensitive musíme udělat klientsky)
+      var profSnap = await getDocs(collection(db,"profiles"));
+      var candidates = [];
+      profSnap.docs.forEach(function(d){
+        var data = d.data();
+        if(norm(data.displayName) === norm(name) && norm(data.location) === norm(loc)){
+          candidates.push({id:d.id, data:data});
+        }
+      });
+
+      if(candidates.length === 0){
+        setError("Nenašli jsme profil s touto přezdívkou a městem. Zkontrolujte, že je zadáváte přesně tak, jak jste je vyplnil(a) při registraci.");
+        setSearching(false); return;
+      }
+
+      // 2) Pro každého kandidáta zkontroluj, jestli má některý jeho inzerát zadaný název rostliny
+      var matchedProfile = null;
+      for(var i=0;i<candidates.length;i++){
+        var c = candidates[i];
+        var plantQ = query(collection(db,"plants"),where("userId","==",c.id));
+        var plantSnap = await getDocs(plantQ);
+        var hasMatch = plantSnap.docs.some(function(pd){
+          var pname = (pd.data().name||"").toLowerCase();
+          return pname.includes(norm(plant));
+        });
+        if(hasMatch){
+          // Nemůžeme jednoznačně určit, pokud jich je víc — pak to bude konflikt
+          if(matchedProfile){
+            setError("Nalezli jsme více účtů odpovídajících těmto údajům. Pro bezpečnost nemůžeme automaticky pokračovat. Napište nám prosím do FB skupiny a pomůžeme vám ručně.");
+            setSearching(false); return;
+          }
+          matchedProfile = {id:c.id, data:c.data, plants:plantSnap.docs.map(function(d){return {id:d.id, data:d.data()};})};
+        }
+      }
+
+      if(!matchedProfile){
+        setError("Údaje sice odpovídají profilu, ale neznáme inzerát na rostlinu, kterou jste zadal(a). Zkuste zadat jinou rostlinu, kterou jste nabízel(a) nebo poptával(a).");
+        setSearching(false); return;
+      }
+
+      // 3) Najít chaty, kde figuruje staré UID
+      var chatQ = query(collection(db,"chats"),where("participants","array-contains",matchedProfile.id));
+      var chatSnap = await getDocs(chatQ);
+      matchedProfile.chats = chatSnap.docs.map(function(d){return {id:d.id, data:d.data()};});
+
+      setFound(matchedProfile);
+      setStep(2);
+      setSearching(false);
+    }catch(err){
+      console.error("Recovery search error:",err);
+      setError("Při hledání nastala chyba. Zkuste to prosím znovu, nebo nás kontaktujte.");
+      setSearching(false);
+    }
+  }
+
+  async function performRecovery(){
+    if(!found) return;
+    setStep(3);
+    var newUid = auth.currentUser ? auth.currentUser.uid : null;
+    if(!newUid){
+      setError("Nejste přihlášen(a). Zavřete tuto obrazovku a zkuste to znovu.");
+      setStep(2);
+      return;
+    }
+    var oldUid = found.id;
+    if(oldUid === newUid){
+      setError("Aktuální účet už je shodný s nalezeným profilem. Není co obnovovat.");
+      setStep(2);
+      return;
+    }
+
+    try{
+      // 0) Označit starý profil příznakem recoveryTo, aby rules dovolily přepis plants
+      await updateDoc(doc(db,"profiles",oldUid),{recoveryTo:newUid,recoveryAt:Date.now()});
+
+      // 1) Update všech plants ze starého userId na nový
+      var totalPlants = found.plants.length;
+      setProgress({phase:"Převod inzerátů",done:0,total:totalPlants});
+      for(var i=0;i<found.plants.length;i++){
+        await updateDoc(doc(db,"plants",found.plants[i].id),{userId:newUid});
+        setProgress({phase:"Převod inzerátů",done:i+1,total:totalPlants});
+      }
+
+      // 2) Update všech chats — přepsat participants, lastSenderId, readBy
+      var totalChats = found.chats.length;
+      setProgress({phase:"Převod chatů",done:0,total:totalChats});
+      var oldChatIdToNew = {};
+      for(var j=0;j<found.chats.length;j++){
+        var ch = found.chats[j];
+        var newParticipants = (ch.data.participants||[]).map(function(p){return p===oldUid?newUid:p;});
+        var newLastSenderId = ch.data.lastSenderId===oldUid ? newUid : ch.data.lastSenderId;
+        var newReadBy = (ch.data.readBy||[]).map(function(p){return p===oldUid?newUid:p;});
+        // Nový chat ID — vygenerujeme stejně jako appka v startChat
+        // chatId formát: sortedUid1_sortedUid2_plantId — ale plantId neznáme z chats; nicméně v ID už je
+        // Nejjednodušší: nepřejmenováváme chatId, jen měníme uvnitř pole participants
+        // To znamená, že stávající chat zůstane funkční podle dokumentu, ale appka v startChat
+        // by vygenerovala jiné ID. Vyřešíme to v dalším kroku: necháme dokument na starém ID,
+        // ale přepíšeme participants. Když uživatel napíše tu samou osobu znovu, vznikne nový chat,
+        // což není ideální. Proto duplikujeme: nový dokument se správným chatId, smazat starý.
+        // Pro jednoduchost teď: necháme starý chatId, uživatel uvidí historii. Když napíše tutéž
+        // osobu znovu, vznikne nový chat. To je akceptovatelné UX.
+        await updateDoc(doc(db,"chats",ch.id),{
+          participants:newParticipants,
+          lastSenderId:newLastSenderId,
+          readBy:newReadBy
+        });
+        setProgress({phase:"Převod chatů",done:j+1,total:totalChats});
+      }
+
+      // 3) Zkopírovat profil ze starého na nový UID (zachovat displayName, location, případně email)
+      setProgress({phase:"Aktualizace profilu",done:0,total:1});
+      var newProfileData = {
+        displayName: found.data.displayName,
+        location: found.data.location,
+        createdAt: found.data.createdAt || Date.now()
+      };
+      if(found.data.email) newProfileData.email = found.data.email;
+      await setDoc(doc(db,"profiles",newUid), newProfileData, {merge:true});
+      setProgress({phase:"Aktualizace profilu",done:1,total:1});
+
+      // 4) Log do recoveryLog
+      try{
+        await addDoc(collection(db,"recoveryLog"),{
+          oldUid:oldUid,
+          newUid:newUid,
+          displayName:found.data.displayName,
+          location:found.data.location,
+          plantsCount:totalPlants,
+          chatsCount:totalChats,
+          timestamp:Date.now(),
+          userAgent:(typeof navigator!=="undefined"?navigator.userAgent:"").slice(0,200)
+        });
+      }catch(e){console.warn("recoveryLog write failed",e);}
+
+      // 5) Smazat starý profil
+      try{await deleteDoc(doc(db,"profiles",oldUid));}catch(e){console.warn("delete old profile failed",e);}
+
+      // 6) Vymazat cache
+      try{localStorage.removeItem("odkopni_plants_cache");localStorage.removeItem("odkopni_profiles_cache");}catch(e){}
+
+      setStep(4);
+    }catch(err){
+      console.error("Recovery error:",err);
+      var msg = "Při obnovování nastala chyba. ";
+      if(err && err.code === "permission-denied") msg += "Chybí oprávnění — pravděpodobně je nutné aktualizovat Firestore pravidla.";
+      else if(err && err.message) msg += err.message;
+      setError(msg);
+      setStep(2);
+    }
+  }
+
+  return(
+    <div>
+      <InAppBrowserBanner />
+      <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"linear-gradient(160deg, "+C.bg+" 0%, #e8f0ea 50%, "+C.bg+" 100%)",padding:"24px"}}>
+      <div style={{width:"100%",maxWidth:"420px"}}>
+        <button onClick={onBack} style={{background:"none",border:"none",cursor:"pointer",padding:"8px 0",display:"flex",alignItems:"center",gap:"6px",color:C.sub,fontSize:"13px",marginBottom:"16px"}}><I.Back s={16} c={C.sub} /> Zpět</button>
+
+        {step===1 && (
+          <div style={{background:"white",borderRadius:"20px",padding:"24px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)"}}>
+            <div style={{fontSize:"42px",textAlign:"center",marginBottom:"8px"}}>🔍</div>
+            <h2 style={{margin:"0 0 8px",fontSize:"22px",fontWeight:"700",fontFamily:"'Playfair Display', Georgia, serif",color:C.text,textAlign:"center"}}>Najít můj starý účet</h2>
+            <p style={{margin:"0 0 20px",fontSize:"13px",color:C.sub,textAlign:"center",lineHeight:"1.5"}}>Zadejte přesně to, jak jste se zaregistroval(a). Pro ověření vás požádáme o název rostliny, kterou jste nabízel(a) nebo poptával(a).</p>
+
+            <div style={{marginBottom:"12px"}}>
+              <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Přezdívka *</label>
+              <input value={name} onChange={function(e){setName(e.target.value);}} placeholder="Tak jak jste se zadal(a)" style={INPUT_STYLE} onFocus={function(e){e.target.style.borderColor=C.primary;}} onBlur={function(e){e.target.style.borderColor=C.border;}} />
+            </div>
+            <div style={{marginBottom:"12px"}}>
+              <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Město *</label>
+              <input value={loc} onChange={function(e){setLoc(e.target.value);}} placeholder="Stejně jako při registraci" style={INPUT_STYLE} onFocus={function(e){e.target.style.borderColor=C.primary;}} onBlur={function(e){e.target.style.borderColor=C.border;}} />
+            </div>
+            <div style={{marginBottom:"18px"}}>
+              <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Název rostliny v některém z vašich inzerátů *</label>
+              <PlantAC value={plant} onChange={setPlant} placeholder="Stačí část názvu, např. pivoňka" />
+              <div style={{fontSize:"11px",color:C.muted,marginTop:"6px",lineHeight:"1.4"}}>Sloužilo k ověření, že jste majitel účtu.</div>
+            </div>
+
+            {error && (<div style={{marginBottom:"14px",padding:"12px 14px",background:C.danger+"12",border:"1px solid "+C.danger+"40",borderRadius:"12px",fontSize:"13px",color:C.danger,lineHeight:"1.5"}}>⚠️ {error}</div>)}
+
+            <button onClick={searchProfile} disabled={!name.trim()||!loc.trim()||!plant.trim()||searching} style={{width:"100%",padding:"14px",border:"none",borderRadius:"14px",background:(name.trim()&&loc.trim()&&plant.trim())?"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")":"#e0e0e0",color:"white",fontSize:"15px",fontWeight:"700",cursor:searching?"default":"pointer",opacity:searching?0.7:1}}>{searching?"Hledám...":"🔍 Najít účet"}</button>
+          </div>
+        )}
+
+        {step===2 && found && (
+          <div style={{background:"white",borderRadius:"20px",padding:"24px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)"}}>
+            <div style={{fontSize:"42px",textAlign:"center",marginBottom:"8px"}}>✅</div>
+            <h2 style={{margin:"0 0 16px",fontSize:"22px",fontWeight:"700",fontFamily:"'Playfair Display', Georgia, serif",color:C.text,textAlign:"center"}}>Účet nalezen!</h2>
+            <div style={{background:C.bg,borderRadius:"14px",padding:"16px",marginBottom:"16px"}}>
+              <div style={{fontSize:"13px",color:C.sub,marginBottom:"6px"}}>Vrátíme vás k profilu:</div>
+              <div style={{fontSize:"18px",fontWeight:"700",color:C.text,marginBottom:"4px"}}>{found.data.displayName}</div>
+              <div style={{fontSize:"13px",color:C.muted,display:"flex",alignItems:"center",gap:"5px",marginBottom:"12px"}}><I.Pin s={12} c={C.muted} /> {found.data.location}</div>
+              <div style={{display:"flex",gap:"16px",paddingTop:"12px",borderTop:"1px solid "+C.border}}>
+                <div><div style={{fontSize:"20px",fontWeight:"700",color:C.primary}}>{found.plants.length}</div><div style={{fontSize:"11px",color:C.muted}}>inzerátů</div></div>
+                <div><div style={{fontSize:"20px",fontWeight:"700",color:C.primary}}>{found.chats.length}</div><div style={{fontSize:"11px",color:C.muted}}>chatů</div></div>
+              </div>
+            </div>
+
+            <p style={{margin:"0 0 16px",fontSize:"13px",color:C.sub,lineHeight:"1.5"}}>Tímto převedeme vaše inzeráty a chaty na váš aktuální přihlášený účet. Starý profil se smaže. Akce je nevratná.</p>
+
+            {error && (<div style={{marginBottom:"14px",padding:"12px 14px",background:C.danger+"12",border:"1px solid "+C.danger+"40",borderRadius:"12px",fontSize:"13px",color:C.danger,lineHeight:"1.5"}}>⚠️ {error}</div>)}
+
+            <div style={{display:"flex",gap:"8px"}}>
+              <button onClick={function(){setStep(1);setFound(null);setError("");}} style={{flex:1,padding:"12px",border:"2px solid "+C.border,borderRadius:"12px",background:"white",color:C.sub,fontSize:"13px",fontWeight:"600",cursor:"pointer"}}>Není to ono</button>
+              <button onClick={performRecovery} style={{flex:2,padding:"12px",border:"none",borderRadius:"12px",background:"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")",color:"white",fontSize:"14px",fontWeight:"700",cursor:"pointer"}}>✓ Pokračovat a obnovit účet</button>
+            </div>
+          </div>
+        )}
+
+        {step===3 && (
+          <div style={{background:"white",borderRadius:"20px",padding:"32px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)",textAlign:"center"}}>
+            <div style={{fontSize:"42px",marginBottom:"12px"}}>⏳</div>
+            <h2 style={{margin:"0 0 8px",fontSize:"20px",fontWeight:"700",color:C.text}}>Obnovuji účet...</h2>
+            <p style={{margin:"0 0 16px",fontSize:"13px",color:C.sub}}>{progress.phase}{progress.total>0?(" ("+progress.done+"/"+progress.total+")"):""}</p>
+            <div style={{background:C.bg,borderRadius:"8px",overflow:"hidden",height:"6px"}}>
+              <div style={{background:C.primary,height:"100%",width:(progress.total>0?(progress.done/progress.total*100)+"%":"0%"),transition:"width 0.3s"}}></div>
+            </div>
+            <p style={{margin:"16px 0 0",fontSize:"11px",color:C.muted}}>Prosím nezavírejte tuto stránku.</p>
+          </div>
+        )}
+
+        {step===4 && (
+          <div style={{background:"white",borderRadius:"20px",padding:"32px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)",textAlign:"center"}}>
+            <div style={{fontSize:"56px",marginBottom:"8px"}}>🎉</div>
+            <h2 style={{margin:"0 0 8px",fontSize:"22px",fontWeight:"700",fontFamily:"'Playfair Display', Georgia, serif",color:C.text}}>Hotovo!</h2>
+            <p style={{margin:"0 0 20px",fontSize:"14px",color:C.sub,lineHeight:"1.5"}}>Váš účet byl úspěšně obnoven. Doporučujeme nyní v profilu propojit účet s Google, aby se vám tato situace už neopakovala.</p>
+            <button onClick={onDone} style={{width:"100%",padding:"14px",border:"none",borderRadius:"14px",background:"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")",color:"white",fontSize:"15px",fontWeight:"700",cursor:"pointer"}}>Pokračovat do appky 🌿</button>
+          </div>
+        )}
+      </div>
+      </div>
+    </div>);
+}
+
+
 function Welcome(){
   const [name,setName]=useState("");const [loc,setLoc]=useState("");const [want,setWant]=useState("");const [saving,setSaving]=useState(false);
   const [googleLoading,setGoogleLoading]=useState(false);
+  const [showRecovery,setShowRecovery]=useState(false);
   var ok=name.trim()&&loc.trim();
+
+  // Pokud uživatel klikl na "obnovit", musí být nejdřív přihlášený (anonymně), aby měl UID pro převod
+  async function startRecovery(){
+    try{
+      if(!auth.currentUser){
+        await signInAnonymously(auth);
+      }
+      setShowRecovery(true);
+    }catch(err){
+      alert("Nepodařilo se připravit obnovení účtu. "+(err&&err.message?err.message:""));
+    }
+  }
+
+  if(showRecovery){
+    return <RecoverAccount onBack={function(){setShowRecovery(false);}} onDone={function(){window.location.reload();}} />;
+  }
 
   async function go(){
     if(!ok||saving)return;setSaving(true);
@@ -496,7 +790,9 @@ function Welcome(){
   }
 
   return(
-    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"linear-gradient(160deg, "+C.bg+" 0%, #e8f0ea 50%, "+C.bg+" 100%)",padding:"24px"}}>
+    <div>
+      <InAppBrowserBanner />
+      <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"linear-gradient(160deg, "+C.bg+" 0%, #e8f0ea 50%, "+C.bg+" 100%)",padding:"24px"}}>
       <div style={{width:"100%",maxWidth:"380px",textAlign:"center"}}>
         <div style={{fontSize:"52px",marginBottom:"8px"}}>🌱</div>
         <h1 style={{fontSize:"36px",fontWeight:"800",fontFamily:"'Playfair Display', Georgia, serif",color:C.text,margin:"0 0 6px",letterSpacing:"-1px"}}>Odkopni</h1>
@@ -519,6 +815,14 @@ function Welcome(){
         </button>
 
         <p style={{fontSize:"11px",color:C.muted,marginTop:"18px",lineHeight:"1.5"}}>Anonymní vstup uloží data jen do tohoto prohlížeče.<br/>Přes Google si svůj účet zachováte i jinde.</p>
+
+        <div style={{marginTop:"24px",paddingTop:"20px",borderTop:"1px solid "+C.border}}>
+          <button onClick={startRecovery} style={{background:"none",border:"none",cursor:"pointer",color:C.primary,fontSize:"13px",fontWeight:"600",textDecoration:"underline",padding:"6px"}}>
+            Už jsem tu byl(a), ale nevidím své inzeráty →
+          </button>
+          <div style={{fontSize:"11px",color:C.muted,marginTop:"4px",lineHeight:"1.4"}}>Pomocí přezdívky, města a názvu jedné z vašich rostlin obnovíme přístup.</div>
+        </div>
+      </div>
       </div>
     </div>);
 }
@@ -763,6 +1067,8 @@ export default function App(){
   return(
     <div style={{minHeight:"100vh",background:C.bg,fontFamily:"'DM Sans', 'Segoe UI', system-ui, sans-serif"}}>
       <style>{"@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700;800&family=DM+Sans:wght@400;500;600;700&display=swap');@keyframes slideUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}*{box-sizing:border-box}input,textarea,button{font-family:inherit}html,body{overflow-x:hidden;background-color:#f4f7f5}input,textarea{color:#1a2e1f}"}</style>
+
+      <InAppBrowserBanner />
 
       <header style={{padding:"10px 16px",background:"rgba(255,255,255,0.88)",backdropFilter:"blur(12px)",borderBottom:"1px solid "+C.border,position:"sticky",top:0,zIndex:100}}>
         <div style={{maxWidth:"960px",margin:"0 auto"}}>

@@ -724,10 +724,9 @@ function RecoverAccount({onBack,onDone}){
 }
 
 
-function Welcome(){
+function Welcome({onStartRecovery}){
   const [name,setName]=useState("");const [loc,setLoc]=useState("");const [want,setWant]=useState("");const [saving,setSaving]=useState(false);
   const [googleLoading,setGoogleLoading]=useState(false);
-  const [showRecovery,setShowRecovery]=useState(false);
   var ok=name.trim()&&loc.trim();
 
   // Pokud uživatel klikl na "obnovit", musí být nejdřív přihlášený (anonymně), aby měl UID pro převod
@@ -736,14 +735,10 @@ function Welcome(){
       if(!auth.currentUser){
         await signInAnonymously(auth);
       }
-      setShowRecovery(true);
+      if(onStartRecovery) onStartRecovery();
     }catch(err){
       alert("Nepodařilo se připravit obnovení účtu. "+(err&&err.message?err.message:""));
     }
-  }
-
-  if(showRecovery){
-    return <RecoverAccount onBack={function(){setShowRecovery(false);}} onDone={function(){window.location.reload();}} />;
   }
 
   async function go(){
@@ -941,6 +936,7 @@ export default function App(){
   const [allProfiles,setAllProfiles]=useState([]);
   const [bannerDismissed,setBannerDismissed]=useState(function(){try{return localStorage.getItem("odkopni_banner_dismissed")==="1";}catch(e){return false;}});
   const [favs,setFavs]=useState(function(){try{return JSON.parse(localStorage.getItem("odkopni_favs")||"[]");}catch(e){return[];}});
+  const [showRecovery,setShowRecovery]=useState(false);
 
   useEffect(function(){var unsub=onAuthStateChanged(auth,async function(u){setUser(u);if(u){try{var profSnap=await getDoc(doc(db,"profiles",u.uid));if(profSnap.exists())setProfile(profSnap.data());else setProfile(null);}catch(e){}}else{setProfile(null);}});return unsub;},[]);
 
@@ -1060,8 +1056,9 @@ export default function App(){
   var hasMyPosts = user && plants.some(function(p){return p.userId===user.uid;});
 
   if(user===undefined)return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:C.bg}}><div style={{fontSize:"36px"}}>🌱</div></div>;
-  if(!user)return <Welcome />;
-  if(!profile)return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:C.bg,flexDirection:"column",gap:"12px"}}><div style={{fontSize:"36px"}}>🌱</div><div style={{color:C.muted,fontSize:"14px"}}>Načítám profil...</div></div>;
+  if(!user)return <Welcome onStartRecovery={function(){setShowRecovery(true);}} />;
+  if(showRecovery)return <RecoverAccount onBack={function(){setShowRecovery(false);}} onDone={function(){window.location.reload();}} />;
+  if(!profile)return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:C.bg,flexDirection:"column",gap:"12px"}}><div style={{fontSize:"36px"}}>🌱</div><div style={{color:C.muted,fontSize:"14px"}}>Načítám profil...</div><button onClick={function(){setShowRecovery(true);}} style={{marginTop:"8px",background:"none",border:"none",color:C.primary,fontSize:"13px",fontWeight:"600",textDecoration:"underline",cursor:"pointer"}}>Mám problém s účtem →</button></div>;
   if(activeChat)return <ChatView chat={activeChat} user={user} onBack={function(){setActiveChat(null);}} onMarkRead={markRead} />;
 
   return(

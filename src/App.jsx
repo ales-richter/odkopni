@@ -640,20 +640,82 @@ export default function App(){
 
   useEffect(function(){var unsub=onAuthStateChanged(auth,async function(u){setUser(u);if(u){try{var profSnap=await getDoc(doc(db,"profiles",u.uid));if(profSnap.exists())setProfile(profSnap.data());else setProfile(null);}catch(e){}}else{setProfile(null);}});return unsub;},[]);
 
-  useEffect(function(){(async function(){try{var q2=query(collection(db,"plants"),orderBy("createdAt","desc"));var snap=await getDocs(q2);setPlants(snap.docs.map(function(d){return Object.assign({id:d.id},d.data());}));}catch(e){}})();},[]);
+  // ── Plants: cache 5 minut v localStorage, sníží Firestore čtení o ~90% ──
+  useEffect(function(){
+    (async function(){
+      try{
+        var CACHE_KEY="odkopni_plants_cache";
+        var CACHE_TTL=5*60*1000; // 5 minut
+        // Nejdřív zkus cache
+        try{
+          var cached=JSON.parse(localStorage.getItem(CACHE_KEY)||"null");
+          if(cached && cached.ts && (Date.now()-cached.ts)<CACHE_TTL && Array.isArray(cached.data)){
+            setPlants(cached.data);
+            return; // máme čerstvou cache, žádné Firestore čtení
+          }
+        }catch(e){}
+        // Cache neexistuje nebo je stará → načti z Firestore
+        var q2=query(collection(db,"plants"),orderBy("createdAt","desc"));
+        var snap=await getDocs(q2);
+        var data=snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+        setPlants(data);
+        try{localStorage.setItem(CACHE_KEY,JSON.stringify({ts:Date.now(),data:data}));}catch(e){}
+      }catch(e){}
+    })();
+  },[]);
 
-  // Load all profiles for community bar
-  useEffect(function(){(async function(){try{var snap=await getDocs(collection(db,"profiles"));setAllProfiles(snap.docs.map(function(d){return d.data();}));}catch(e){}})();},[]);
+  // ── Profiles pro CommunityBar: cache 10 minut (HLAVNÍ ŽROUT! 300 čtení/návštěva → 30) ──
+  useEffect(function(){
+    (async function(){
+      try{
+        var CACHE_KEY="odkopni_profiles_cache";
+        var CACHE_TTL=10*60*1000; // 10 minut
+        try{
+          var cached=JSON.parse(localStorage.getItem(CACHE_KEY)||"null");
+          if(cached && cached.ts && (Date.now()-cached.ts)<CACHE_TTL && Array.isArray(cached.data)){
+            setAllProfiles(cached.data);
+            return;
+          }
+        }catch(e){}
+        var snap=await getDocs(collection(db,"profiles"));
+        var data=snap.docs.map(function(d){return d.data();});
+        setAllProfiles(data);
+        try{localStorage.setItem(CACHE_KEY,JSON.stringify({ts:Date.now(),data:data}));}catch(e){}
+      }catch(e){}
+    })();
+  },[]);
 
-  useEffect(function(){if(!user)return;async function checkUnread(){try{var q2=query(collection(db,"chats"),where("participants","array-contains",user.uid));var snap=await getDocs(q2);var count=0;snap.docs.forEach(function(d){var data=d.data();var readBy=data.readBy||[];if(data.lastSenderId&&data.lastSenderId!==user.uid&&!readBy.includes(user.uid))count++;});setUnreadCount(count);}catch(e){}}checkUnread();var interval=setInterval(checkUnread,15000);return function(){clearInterval(interval);};},[user]);
+  // ── Unread count: kontrola jednou za 60s (místo 15s) — 4× méně čtení ──
+  useEffect(function(){
+    if(!user)return;
+    async function checkUnread(){
+      try{
+        var q2=query(collection(db,"chats"),where("participants","array-contains",user.uid));
+        var snap=await getDocs(q2);
+        var count=0;
+        snap.docs.forEach(function(d){
+          var data=d.data();
+          var readBy=data.readBy||[];
+          if(data.lastSenderId&&data.lastSenderId!==user.uid&&!readBy.includes(user.uid))count++;
+        });
+        setUnreadCount(count);
+      }catch(e){}
+    }
+    checkUnread();
+    var interval=setInterval(checkUnread,60000); // 60s místo 15s
+    return function(){clearInterval(interval);};
+  },[user]);
 
   useEffect(function(){try{localStorage.setItem("odkopni_favs",JSON.stringify(favs));}catch(e){}},[favs]);
 
+  // Pomocná funkce — invaliduje plants cache po vlastní změně
+  function invalidatePlantsCache(){try{localStorage.removeItem("odkopni_plants_cache");}catch(e){}}
+
   function toggleFav(id){setFavs(function(f){return f.includes(id)?f.filter(function(x){return x!==id;}):f.concat([id]);});}
-  function addPlant(p){setPlants(function(prev){return[p].concat(prev);});}
-  function updatePlant(p){setPlants(function(prev){return prev.map(function(x){return x.id===p.id?p:x;});});setSel(null);}
-  async function delPlant(id){try{await deleteDoc(doc(db,"plants",id));setPlants(plants.filter(function(p){return p.id!==id;}));}catch(e){}}
-  async function changeStatus(id,status){try{await updateDoc(doc(db,"plants",id),{status:status});setPlants(plants.map(function(p){return p.id===id?Object.assign({},p,{status:status}):p;}));setSel(function(s){return s&&s.id===id?Object.assign({},s,{status:status}):s;});}catch(e){}}
+  function addPlant(p){setPlants(function(prev){return[p].concat(prev);});invalidatePlantsCache();}
+  function updatePlant(p){setPlants(function(prev){return prev.map(function(x){return x.id===p.id?p:x;});});invalidatePlantsCache();setSel(null);}
+  async function delPlant(id){try{await deleteDoc(doc(db,"plants",id));setPlants(plants.filter(function(p){return p.id!==id;}));invalidatePlantsCache();}catch(e){}}
+  async function changeStatus(id,status){try{await updateDoc(doc(db,"plants",id),{status:status});setPlants(plants.map(function(p){return p.id===id?Object.assign({},p,{status:status}):p;}));invalidatePlantsCache();setSel(function(s){return s&&s.id===id?Object.assign({},s,{status:status}):s;});}catch(e){}}
   function startChat(plant){var ids=[user.uid,plant.userId].sort();setActiveChat({id:ids[0]+"_"+ids[1]+"_"+plant.id,plantName:plant.name,participants:[user.uid,plant.userId]});}
   async function markRead(chatId){try{var chatRef=doc(db,"chats",chatId);var chatSnap=await getDoc(chatRef);if(chatSnap.exists()){var data=chatSnap.data();var readBy=data.readBy||[];if(!readBy.includes(user.uid)){readBy.push(user.uid);await updateDoc(chatRef,{readBy:readBy});}}var q2=query(collection(db,"chats"),where("participants","array-contains",user.uid));var snap=await getDocs(q2);var count=0;snap.docs.forEach(function(d){var dd=d.data();var rb=dd.readBy||[];if(dd.lastSenderId&&dd.lastSenderId!==user.uid&&!rb.includes(user.uid))count++;});setUnreadCount(count);}catch(e){}}
   function handleEdit(plant){setEditPlant(plant);setAddMode(plant.type==="demand"?"demand":"offer");setShowAdd(true);}

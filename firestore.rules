@@ -1,0 +1,86 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: vrátí true, pokud profil s daným UID má pole recoveryTo nastavené na aktuálního uživatele
+    function isRecoveryTarget(oldUid) {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/profiles/$(oldUid))
+        && get(/databases/$(database)/documents/profiles/$(oldUid)).data.recoveryTo == request.auth.uid;
+    }
+
+    // ── Plants — číst kdokoliv, psát jen owner, recovery flow může přepsat userId ──
+    match /plants/{plantId} {
+      allow read: if true;
+      allow create: if request.auth != null;
+      // Update: buď owner, nebo recovery target který přepisuje userId
+      allow update: if request.auth != null
+        && (
+          resource.data.userId == request.auth.uid
+          || (
+            isRecoveryTarget(resource.data.userId)
+            && request.resource.data.userId == request.auth.uid
+          )
+        );
+      allow delete: if request.auth != null
+        && resource.data.userId == request.auth.uid;
+    }
+
+    // ── Zprávy — číst a psát jen přihlášení (filtrování dělá appka) ──
+    match /messages/{messageId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // ── Chaty — read/write přihlášený. Update může i recovery target ──
+    match /chats/{chatId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+      // Update povolen, pokud jsem účastník, nebo pokud jsem recovery target některého z účastníků
+      allow update: if request.auth != null
+        && (
+          request.auth.uid in resource.data.participants
+          || (
+            resource.data.participants.size() > 0
+            && (
+              isRecoveryTarget(resource.data.participants[0])
+              || isRecoveryTarget(resource.data.participants[1])
+            )
+          )
+        );
+      allow delete: if request.auth != null
+        && request.auth.uid in resource.data.participants;
+    }
+
+    // ── Profily — kdokoliv čte, write jen vlastní + správa recovery flagu ──
+    match /profiles/{profileId} {
+      allow read: if true;
+      // Vlastní profil: může psát kdokoliv (svůj)
+      // Cizí profil: může nastavit pouze pole recoveryTo (a recoveryAt) a smazat jej, pokud je sám cílem recovery
+      allow create: if request.auth != null && request.auth.uid == profileId;
+      allow update: if request.auth != null
+        && (
+          // Vlastní profil
+          request.auth.uid == profileId
+          || (
+            // Cizí profil: povolíme nastavení recoveryTo na mě (řízeno klientem v recovery flow)
+            request.resource.data.recoveryTo == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['recoveryTo','recoveryAt'])
+          )
+        );
+      allow delete: if request.auth != null
+        && (
+          request.auth.uid == profileId
+          || isRecoveryTarget(profileId)
+        );
+    }
+
+    // ── Recovery log — read jen vlastní záznamy, write kdokoliv přihlášený ──
+    match /recoveryLog/{logId} {
+      allow create: if request.auth != null
+        && request.resource.data.newUid == request.auth.uid;
+      allow read: if request.auth != null
+        && resource.data.newUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}

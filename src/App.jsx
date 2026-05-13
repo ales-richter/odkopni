@@ -3,6 +3,8 @@ import {
   auth, db,
   signInAnonymously, onAuthStateChanged,
   googleProvider, signInWithPopup, linkWithPopup,
+  sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink,
+  EmailAuthProvider, linkWithCredential,
   collection, addDoc, getDocs, getDoc, updateDoc, deleteDoc,
   doc, query, where, orderBy, onSnapshot, setDoc
 } from "./firebase";
@@ -10,6 +12,12 @@ import {
 // ============================================================
 // 🌱 ODKOPNI — výměnný marketplace pro zahradní trvalky
 // ============================================================
+
+// Konec "amnestie" pro recovery — profily vytvořené před tímto datem
+// mohou být obnoveny pomocí přezdívky+města+rostliny+emailu (jakýkoliv email).
+// Profily vytvořené po tomto datu (s povinným emailem) lze obnovit pouze
+// pomocí emailu shodného s tím v profilu.
+var RECOVERY_AMNESTY_END = 1780394108578; // 2. června 2026
 
 const CZ_PERENNIALS = [
   "Achillea millefolium – Řebříček obecný","Aconitum napellus – Oměj šalamounek","Agastache foeniculum – Agastache fenyklová",
@@ -474,19 +482,23 @@ function InAppBrowserBanner(){
 
 // ── Recovery účtu — vyhledá starý profil a převede ho na aktuální session ──
 function RecoverAccount({onBack,onDone}){
-  const [step,setStep]=useState(1); // 1=zadej údaje, 2=potvrď, 3=migrace, 4=hotovo
+  const [step,setStep]=useState(1); // 1=zadej údaje, 2=potvrď, 3=odesílám email, 4=email odeslán
   const [name,setName]=useState("");
   const [loc,setLoc]=useState("");
   const [plant,setPlant]=useState("");
+  const [email,setEmail]=useState("");
   const [searching,setSearching]=useState(false);
+  const [sending,setSending]=useState(false);
   const [found,setFound]=useState(null); // {profile, profileId, plants, chats}
   const [error,setError]=useState("");
-  const [progress,setProgress]=useState({phase:"",done:0,total:0});
 
   function norm(s){return (s||"").trim().toLowerCase();}
 
   async function searchProfile(){
-    if(!name.trim()||!loc.trim()||!plant.trim()||searching) return;
+    if(!name.trim()||!loc.trim()||!plant.trim()||!email.trim()||searching) return;
+    if(!email.includes("@") || email.length<5){
+      setError("Zadejte prosím platný e-mail.");return;
+    }
     setSearching(true);setError("");
     try{
       // 1) Najít všechny profily s odpovídající přezdívkou (case-insensitive musíme udělat klientsky)
@@ -508,6 +520,18 @@ function RecoverAccount({onBack,onDone}){
       var matchedProfile = null;
       for(var i=0;i<candidates.length;i++){
         var c = candidates[i];
+        // Bezpečnostní logika:
+        // - Pokud má profil již email, ten musí sedět (přísná shoda)
+        // - Pokud profil vytvořený PO amnestii (createdAt >= RECOVERY_AMNESTY_END) a nemá email,
+        //   odmítneme — taký profil by neměl existovat (validační kontrola)
+        if(c.data.email && c.data.email.trim()){
+          if(norm(c.data.email) !== norm(email)){
+            continue; // Tento kandidát se přeskočí — uživatel zadal jiný email, než má profil
+          }
+        }else if((c.data.createdAt||0) >= RECOVERY_AMNESTY_END){
+          // Profil je z období po amnestii a nemá email → neobvyklé, přeskočit
+          continue;
+        }
         var plantQ = query(collection(db,"plants"),where("userId","==",c.id));
         var plantSnap = await getDocs(plantQ);
         var hasMatch = plantSnap.docs.some(function(pd){
@@ -515,7 +539,6 @@ function RecoverAccount({onBack,onDone}){
           return pname.includes(norm(plant));
         });
         if(hasMatch){
-          // Nemůžeme jednoznačně určit, pokud jich je víc — pak to bude konflikt
           if(matchedProfile){
             setError("Nalezli jsme více účtů odpovídajících těmto údajům. Pro bezpečnost nemůžeme automaticky pokračovat. Napište nám prosím do FB skupiny a pomůžeme vám ručně.");
             setSearching(false); return;
@@ -525,7 +548,13 @@ function RecoverAccount({onBack,onDone}){
       }
 
       if(!matchedProfile){
-        setError("Údaje sice odpovídají profilu, ale neznáme inzerát na rostlinu, kterou jste zadal(a). Zkuste zadat jinou rostlinu, kterou jste nabízel(a) nebo poptával(a).");
+        // Zkontrolujeme, jestli problém byl jen v emailu, abychom dali jasnější chybu
+        var hadEmailMismatch = candidates.some(function(c){return c.data.email && c.data.email.trim() && norm(c.data.email) !== norm(email);});
+        if(hadEmailMismatch){
+          setError("Profil s touto přezdívkou a městem má v profilu vyplněný jiný e-mail. Pokud jste si email v profilu nastavoval(a), zadejte přesně ten samý.");
+        }else{
+          setError("Údaje sice odpovídají profilu, ale neznáme inzerát na rostlinu, kterou jste zadal(a). Zkuste zadat jinou rostlinu, kterou jste nabízel(a) nebo poptával(a).");
+        }
         setSearching(false); return;
       }
 
@@ -544,99 +573,49 @@ function RecoverAccount({onBack,onDone}){
     }
   }
 
-  async function performRecovery(){
-    if(!found) return;
-    setStep(3);
-    var newUid = auth.currentUser ? auth.currentUser.uid : null;
-    if(!newUid){
-      setError("Nejste přihlášen(a). Zavřete tuto obrazovku a zkuste to znovu.");
-      setStep(2);
-      return;
-    }
+  async function sendRecoveryEmail(){
+    if(!found || sending) return;
+    setSending(true);setError("");
+
     var oldUid = found.id;
-    if(oldUid === newUid){
-      setError("Aktuální účet už je shodný s nalezeným profilem. Není co obnovovat.");
-      setStep(2);
-      return;
-    }
 
     try{
-      // 0) Označit starý profil příznakem recoveryTo, aby rules dovolily přepis plants
-      await updateDoc(doc(db,"profiles",oldUid),{recoveryTo:newUid,recoveryAt:Date.now()});
-
-      // 1) Update všech plants ze starého userId na nový
-      var totalPlants = found.plants.length;
-      setProgress({phase:"Převod inzerátů",done:0,total:totalPlants});
-      for(var i=0;i<found.plants.length;i++){
-        await updateDoc(doc(db,"plants",found.plants[i].id),{userId:newUid});
-        setProgress({phase:"Převod inzerátů",done:i+1,total:totalPlants});
+      // Pokud uživatel není přihlášený, musíme být — bez auth nelze zapisovat recoveryClaim na cizí profil.
+      // Použijeme anonymní přihlášení — tahle session bude jen krátkodobá (uživatel pak klikne v emailu v Chrome).
+      if(!auth.currentUser){
+        await signInAnonymously(auth);
       }
 
-      // 2) Update všech chats — přepsat participants, lastSenderId, readBy
-      var totalChats = found.chats.length;
-      setProgress({phase:"Převod chatů",done:0,total:totalChats});
-      var oldChatIdToNew = {};
-      for(var j=0;j<found.chats.length;j++){
-        var ch = found.chats[j];
-        var newParticipants = (ch.data.participants||[]).map(function(p){return p===oldUid?newUid:p;});
-        var newLastSenderId = ch.data.lastSenderId===oldUid ? newUid : ch.data.lastSenderId;
-        var newReadBy = (ch.data.readBy||[]).map(function(p){return p===oldUid?newUid:p;});
-        // Nový chat ID — vygenerujeme stejně jako appka v startChat
-        // chatId formát: sortedUid1_sortedUid2_plantId — ale plantId neznáme z chats; nicméně v ID už je
-        // Nejjednodušší: nepřejmenováváme chatId, jen měníme uvnitř pole participants
-        // To znamená, že stávající chat zůstane funkční podle dokumentu, ale appka v startChat
-        // by vygenerovala jiné ID. Vyřešíme to v dalším kroku: necháme dokument na starém ID,
-        // ale přepíšeme participants. Když uživatel napíše tu samou osobu znovu, vznikne nový chat,
-        // což není ideální. Proto duplikujeme: nový dokument se správným chatId, smazat starý.
-        // Pro jednoduchost teď: necháme starý chatId, uživatel uvidí historii. Když napíše tutéž
-        // osobu znovu, vznikne nový chat. To je akceptovatelné UX.
-        await updateDoc(doc(db,"chats",ch.id),{
-          participants:newParticipants,
-          lastSenderId:newLastSenderId,
-          readBy:newReadBy
-        });
-        setProgress({phase:"Převod chatů",done:j+1,total:totalChats});
-      }
+      // 1) Zapsat recoveryClaim do starého profilu — slouží jako "tato schránka má nárok"
+      // recoveryClaim obsahuje email + timestamp; po kliknutí v emailu app najde profil podle něj
+      await updateDoc(doc(db,"profiles",oldUid),{
+        recoveryClaim: email.trim().toLowerCase(),
+        recoveryClaimAt: Date.now()
+      });
 
-      // 3) Zkopírovat profil ze starého na nový UID (zachovat displayName, location, případně email)
-      setProgress({phase:"Aktualizace profilu",done:0,total:1});
-      var newProfileData = {
-        displayName: found.data.displayName,
-        location: found.data.location,
-        createdAt: found.data.createdAt || Date.now()
+      // 2) Pošli email link
+      var actionCodeSettings = {
+        url: window.location.origin + "/?recover=1",
+        handleCodeInApp: true
       };
-      if(found.data.email) newProfileData.email = found.data.email;
-      await setDoc(doc(db,"profiles",newUid), newProfileData, {merge:true});
-      setProgress({phase:"Aktualizace profilu",done:1,total:1});
+      await sendSignInLinkToEmail(auth, email.trim(), actionCodeSettings);
 
-      // 4) Log do recoveryLog
+      // 3) Ulož email do localStorage — když uživatel klikne v emailu na stejném zařízení/prohlížeči,
+      // appka si email pamatuje. Když klikne jinde, zeptá se znovu.
       try{
-        await addDoc(collection(db,"recoveryLog"),{
-          oldUid:oldUid,
-          newUid:newUid,
-          displayName:found.data.displayName,
-          location:found.data.location,
-          plantsCount:totalPlants,
-          chatsCount:totalChats,
-          timestamp:Date.now(),
-          userAgent:(typeof navigator!=="undefined"?navigator.userAgent:"").slice(0,200)
-        });
-      }catch(e){console.warn("recoveryLog write failed",e);}
-
-      // 5) Smazat starý profil
-      try{await deleteDoc(doc(db,"profiles",oldUid));}catch(e){console.warn("delete old profile failed",e);}
-
-      // 6) Vymazat cache
-      try{localStorage.removeItem("odkopni_plants_cache");localStorage.removeItem("odkopni_profiles_cache");}catch(e){}
+        localStorage.setItem("odkopni_emailForSignIn", email.trim());
+      }catch(e){}
 
       setStep(4);
+      setSending(false);
     }catch(err){
-      console.error("Recovery error:",err);
-      var msg = "Při obnovování nastala chyba. ";
-      if(err && err.code === "permission-denied") msg += "Chybí oprávnění — pravděpodobně je nutné aktualizovat Firestore pravidla.";
+      console.error("sendRecoveryEmail error:",err);
+      var msg = "Nepodařilo se odeslat e-mail. ";
+      if(err && err.code === "auth/invalid-email") msg += "Zkontrolujte formát e-mailu.";
+      else if(err && err.code === "auth/missing-android-pkg-name" || err.code === "auth/missing-continue-uri" || err.code === "auth/invalid-continue-uri" || err.code === "auth/unauthorized-continue-uri") msg += "Konfigurační chyba — domain musí být v Authorized domains ve Firebase Console.";
       else if(err && err.message) msg += err.message;
       setError(msg);
-      setStep(2);
+      setSending(false);
     }
   }
 
@@ -651,7 +630,7 @@ function RecoverAccount({onBack,onDone}){
           <div style={{background:"white",borderRadius:"20px",padding:"24px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)"}}>
             <div style={{fontSize:"42px",textAlign:"center",marginBottom:"8px"}}>🔍</div>
             <h2 style={{margin:"0 0 8px",fontSize:"22px",fontWeight:"700",fontFamily:"'Playfair Display', Georgia, serif",color:C.text,textAlign:"center"}}>Najít můj starý účet</h2>
-            <p style={{margin:"0 0 20px",fontSize:"13px",color:C.sub,textAlign:"center",lineHeight:"1.5"}}>Zadejte přesně to, jak jste se zaregistroval(a). Pro ověření vás požádáme o název rostliny, kterou jste nabízel(a) nebo poptával(a).</p>
+            <p style={{margin:"0 0 20px",fontSize:"13px",color:C.sub,textAlign:"center",lineHeight:"1.5"}}>Vyplňte údaje ze své registrace. Pošleme vám e-mailem odkaz, kterým se vrátíte ke svému účtu.</p>
 
             <div style={{marginBottom:"12px"}}>
               <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Přezdívka *</label>
@@ -661,15 +640,20 @@ function RecoverAccount({onBack,onDone}){
               <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Město *</label>
               <input value={loc} onChange={function(e){setLoc(e.target.value);}} placeholder="Stejně jako při registraci" style={INPUT_STYLE} onFocus={function(e){e.target.style.borderColor=C.primary;}} onBlur={function(e){e.target.style.borderColor=C.border;}} />
             </div>
-            <div style={{marginBottom:"18px"}}>
+            <div style={{marginBottom:"12px"}}>
               <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Název rostliny v některém z vašich inzerátů *</label>
               <PlantAC value={plant} onChange={setPlant} placeholder="Stačí část názvu, např. pivoňka" />
-              <div style={{fontSize:"11px",color:C.muted,marginTop:"6px",lineHeight:"1.4"}}>Sloužilo k ověření, že jste majitel účtu.</div>
+              <div style={{fontSize:"11px",color:C.muted,marginTop:"6px",lineHeight:"1.4"}}>Slouží k ověření, že jste majitel účtu.</div>
+            </div>
+            <div style={{marginBottom:"18px"}}>
+              <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Váš e-mail *</label>
+              <input type="email" value={email} onChange={function(e){setEmail(e.target.value);}} placeholder="napr@email.cz" style={INPUT_STYLE} onFocus={function(e){e.target.style.borderColor=C.primary;}} onBlur={function(e){e.target.style.borderColor=C.border;}} />
+              <div style={{fontSize:"11px",color:C.muted,marginTop:"6px",lineHeight:"1.4"}}>Sem pošleme odkaz k obnovení. Pokud jste si e-mail v profilu už nastavoval(a), musí to být ten samý.</div>
             </div>
 
             {error && (<div style={{marginBottom:"14px",padding:"12px 14px",background:C.danger+"12",border:"1px solid "+C.danger+"40",borderRadius:"12px",fontSize:"13px",color:C.danger,lineHeight:"1.5"}}>⚠️ {error}</div>)}
 
-            <button onClick={searchProfile} disabled={!name.trim()||!loc.trim()||!plant.trim()||searching} style={{width:"100%",padding:"14px",border:"none",borderRadius:"14px",background:(name.trim()&&loc.trim()&&plant.trim())?"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")":"#e0e0e0",color:"white",fontSize:"15px",fontWeight:"700",cursor:searching?"default":"pointer",opacity:searching?0.7:1}}>{searching?"Hledám...":"🔍 Najít účet"}</button>
+            <button onClick={searchProfile} disabled={!name.trim()||!loc.trim()||!plant.trim()||!email.trim()||searching} style={{width:"100%",padding:"14px",border:"none",borderRadius:"14px",background:(name.trim()&&loc.trim()&&plant.trim()&&email.trim())?"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")":"#e0e0e0",color:"white",fontSize:"15px",fontWeight:"700",cursor:searching?"default":"pointer",opacity:searching?0.7:1}}>{searching?"Hledám...":"🔍 Pokračovat"}</button>
           </div>
         )}
 
@@ -678,7 +662,7 @@ function RecoverAccount({onBack,onDone}){
             <div style={{fontSize:"42px",textAlign:"center",marginBottom:"8px"}}>✅</div>
             <h2 style={{margin:"0 0 16px",fontSize:"22px",fontWeight:"700",fontFamily:"'Playfair Display', Georgia, serif",color:C.text,textAlign:"center"}}>Účet nalezen!</h2>
             <div style={{background:C.bg,borderRadius:"14px",padding:"16px",marginBottom:"16px"}}>
-              <div style={{fontSize:"13px",color:C.sub,marginBottom:"6px"}}>Vrátíme vás k profilu:</div>
+              <div style={{fontSize:"13px",color:C.sub,marginBottom:"6px"}}>Obnovíme přístup k profilu:</div>
               <div style={{fontSize:"18px",fontWeight:"700",color:C.text,marginBottom:"4px"}}>{found.data.displayName}</div>
               <div style={{fontSize:"13px",color:C.muted,display:"flex",alignItems:"center",gap:"5px",marginBottom:"12px"}}><I.Pin s={12} c={C.muted} /> {found.data.location}</div>
               <div style={{display:"flex",gap:"16px",paddingTop:"12px",borderTop:"1px solid "+C.border}}>
@@ -687,35 +671,26 @@ function RecoverAccount({onBack,onDone}){
               </div>
             </div>
 
-            <p style={{margin:"0 0 16px",fontSize:"13px",color:C.sub,lineHeight:"1.5"}}>Tímto převedeme vaše inzeráty a chaty na váš aktuální přihlášený účet. Starý profil se smaže. Akce je nevratná.</p>
+            <p style={{margin:"0 0 16px",fontSize:"13px",color:C.sub,lineHeight:"1.5"}}>Po kliknutí pošleme na <strong>{email}</strong> odkaz. Otevřete e-mail v Chromu, Safari nebo jiném prohlížeči vašeho telefonu (ne ve vestavěném prohlížeči Facebooku!) a klikněte na něj. Tím se přihlásíte ke svému účtu trvale.</p>
 
             {error && (<div style={{marginBottom:"14px",padding:"12px 14px",background:C.danger+"12",border:"1px solid "+C.danger+"40",borderRadius:"12px",fontSize:"13px",color:C.danger,lineHeight:"1.5"}}>⚠️ {error}</div>)}
 
             <div style={{display:"flex",gap:"8px"}}>
               <button onClick={function(){setStep(1);setFound(null);setError("");}} style={{flex:1,padding:"12px",border:"2px solid "+C.border,borderRadius:"12px",background:"white",color:C.sub,fontSize:"13px",fontWeight:"600",cursor:"pointer"}}>Není to ono</button>
-              <button onClick={performRecovery} style={{flex:2,padding:"12px",border:"none",borderRadius:"12px",background:"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")",color:"white",fontSize:"14px",fontWeight:"700",cursor:"pointer"}}>✓ Pokračovat a obnovit účet</button>
+              <button onClick={sendRecoveryEmail} disabled={sending} style={{flex:2,padding:"12px",border:"none",borderRadius:"12px",background:"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")",color:"white",fontSize:"14px",fontWeight:"700",cursor:sending?"default":"pointer",opacity:sending?0.7:1}}>{sending?"Odesílám…":"✉️ Odeslat e-mail s odkazem"}</button>
             </div>
-          </div>
-        )}
-
-        {step===3 && (
-          <div style={{background:"white",borderRadius:"20px",padding:"32px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)",textAlign:"center"}}>
-            <div style={{fontSize:"42px",marginBottom:"12px"}}>⏳</div>
-            <h2 style={{margin:"0 0 8px",fontSize:"20px",fontWeight:"700",color:C.text}}>Obnovuji účet...</h2>
-            <p style={{margin:"0 0 16px",fontSize:"13px",color:C.sub}}>{progress.phase}{progress.total>0?(" ("+progress.done+"/"+progress.total+")"):""}</p>
-            <div style={{background:C.bg,borderRadius:"8px",overflow:"hidden",height:"6px"}}>
-              <div style={{background:C.primary,height:"100%",width:(progress.total>0?(progress.done/progress.total*100)+"%":"0%"),transition:"width 0.3s"}}></div>
-            </div>
-            <p style={{margin:"16px 0 0",fontSize:"11px",color:C.muted}}>Prosím nezavírejte tuto stránku.</p>
           </div>
         )}
 
         {step===4 && (
           <div style={{background:"white",borderRadius:"20px",padding:"32px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)",textAlign:"center"}}>
-            <div style={{fontSize:"56px",marginBottom:"8px"}}>🎉</div>
-            <h2 style={{margin:"0 0 8px",fontSize:"22px",fontWeight:"700",fontFamily:"'Playfair Display', Georgia, serif",color:C.text}}>Hotovo!</h2>
-            <p style={{margin:"0 0 20px",fontSize:"14px",color:C.sub,lineHeight:"1.5"}}>Váš účet byl úspěšně obnoven. Doporučujeme nyní v profilu propojit účet s Google, aby se vám tato situace už neopakovala.</p>
-            <button onClick={onDone} style={{width:"100%",padding:"14px",border:"none",borderRadius:"14px",background:"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")",color:"white",fontSize:"15px",fontWeight:"700",cursor:"pointer"}}>Pokračovat do appky 🌿</button>
+            <div style={{fontSize:"56px",marginBottom:"8px"}}>📬</div>
+            <h2 style={{margin:"0 0 8px",fontSize:"22px",fontWeight:"700",fontFamily:"'Playfair Display', Georgia, serif",color:C.text}}>E-mail odeslán</h2>
+            <p style={{margin:"0 0 14px",fontSize:"14px",color:C.sub,lineHeight:"1.5"}}>Poslali jsme odkaz na <strong>{email}</strong>. Otevřete si e-mail a klikněte na odkaz <strong>v běžném prohlížeči</strong> (Chrome, Safari) — nikoliv ve vestavěném FB prohlížeči.</p>
+            <div style={{background:"#fff8e8",border:"1px solid #f0d090",borderRadius:"12px",padding:"12px 14px",margin:"0 0 16px",fontSize:"12.5px",color:"#7a5a20",lineHeight:"1.5",textAlign:"left"}}>
+              <strong>💡 Tip:</strong> Pokud e-mail nepřišel během minuty, zkontrolujte složku spam. Odesílatel je <em>noreply@odkopni.firebaseapp.com</em>.
+            </div>
+            <button onClick={onBack} style={{width:"100%",padding:"14px",border:"2px solid "+C.border,borderRadius:"14px",background:"white",color:C.sub,fontSize:"14px",fontWeight:"600",cursor:"pointer"}}>Zavřít</button>
           </div>
         )}
       </div>
@@ -724,63 +699,115 @@ function RecoverAccount({onBack,onDone}){
 }
 
 
-function Welcome({onStartRecovery}){
-  const [name,setName]=useState("");const [loc,setLoc]=useState("");const [want,setWant]=useState("");const [saving,setSaving]=useState(false);
-  const [googleLoading,setGoogleLoading]=useState(false);
-  var ok=name.trim()&&loc.trim();
+// ── ProfileSetup — dokončení profilu po prvním přihlášení (Google/email link) ──
+function ProfileSetup({user,initialProfile,onDone}){
+  const [name,setName]=useState((initialProfile&&initialProfile.displayName)||user.displayName||"");
+  const [loc,setLoc]=useState((initialProfile&&initialProfile.location)||"");
+  const [saving,setSaving]=useState(false);
+  const [error,setError]=useState("");
+  var ok = name.trim() && loc.trim();
 
-  // Pokud uživatel klikl na "obnovit", musí být nejdřív přihlášený (anonymně), aby měl UID pro převod
-  async function startRecovery(){
+  async function save(){
+    if(!ok || saving) return;
+    setSaving(true);setError("");
     try{
-      if(!auth.currentUser){
-        await signInAnonymously(auth);
-      }
-      if(onStartRecovery) onStartRecovery();
+      var data = {
+        displayName: name.trim(),
+        location: loc.trim(),
+        email: (initialProfile&&initialProfile.email) || user.email || "",
+        createdAt: (initialProfile&&initialProfile.createdAt) || Date.now()
+      };
+      await setDoc(doc(db,"profiles",user.uid), data, {merge:true});
+      if(onDone) onDone(data);
     }catch(err){
-      alert("Nepodařilo se připravit obnovení účtu. "+(err&&err.message?err.message:""));
+      console.error("ProfileSetup save error:",err);
+      setError("Nepodařilo se uložit profil. "+(err&&err.message?err.message:""));
+      setSaving(false);
     }
   }
 
-  async function go(){
-    if(!ok||saving)return;setSaving(true);
-    try{
-      var result=await signInAnonymously(auth);var uid=result.user.uid;
-      await setDoc(doc(db,"profiles",uid),{displayName:name.trim(),location:loc.trim(),createdAt:Date.now()});
-      if(want.trim()){
-        await addDoc(collection(db,"plants"),{name:want.trim(),type:"demand",category:"",description:"Hledám tuto rostlinu — nabídněte mi výměnu!",lookingFor:"",location:loc.trim(),photos:[],userId:uid,userName:name.trim(),color:"hsl("+Math.floor(Math.random()*360)+",50%,60%)",createdAt:Date.now(),status:"active"});
-      }
-    }catch(err){console.error("Chyba:",err);alert("Nepodařilo se připojit. "+(err&&err.message?err.message:""));setSaving(false);}
-  }
+  return(
+    <div>
+      <InAppBrowserBanner />
+      <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"linear-gradient(160deg, "+C.bg+" 0%, #e8f0ea 50%, "+C.bg+" 100%)",padding:"24px"}}>
+      <div style={{width:"100%",maxWidth:"380px",textAlign:"center"}}>
+        <div style={{fontSize:"52px",marginBottom:"8px"}}>🌱</div>
+        <h1 style={{fontSize:"28px",fontWeight:"800",fontFamily:"'Playfair Display', Georgia, serif",color:C.text,margin:"0 0 6px"}}>Vítejte v Odkopni!</h1>
+        <p style={{fontSize:"14px",color:C.sub,margin:"0 0 24px",lineHeight:"1.5"}}>Pověděli byste nám, jak vám máme říkat a odkud jste?</p>
+
+        <div style={{textAlign:"left",marginBottom:"14px"}}>
+          <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Jak vám máme říkat? *</label>
+          <input value={name} onChange={function(e){setName(e.target.value);}} placeholder="Přezdívka nebo jméno" style={Object.assign({},INPUT_STYLE,{padding:"14px",borderRadius:"14px",fontSize:"15px"})} onFocus={function(e){e.target.style.borderColor=C.primary;}} onBlur={function(e){e.target.style.borderColor=C.border;}} />
+        </div>
+        <div style={{textAlign:"left",marginBottom:"20px"}}>
+          <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Odkud jste? *</label>
+          <input value={loc} onChange={function(e){setLoc(e.target.value);}} placeholder="Město nebo oblast" style={Object.assign({},INPUT_STYLE,{padding:"14px",borderRadius:"14px",fontSize:"15px"})} onFocus={function(e){e.target.style.borderColor=C.primary;}} onBlur={function(e){e.target.style.borderColor=C.border;}} />
+        </div>
+
+        {error && (<div style={{marginBottom:"14px",padding:"12px 14px",background:C.danger+"12",border:"1px solid "+C.danger+"40",borderRadius:"12px",fontSize:"13px",color:C.danger,lineHeight:"1.5"}}>⚠️ {error}</div>)}
+
+        <button onClick={save} disabled={!ok||saving} style={{width:"100%",padding:"16px",border:"none",borderRadius:"14px",background:ok?"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")":"#e0e0e0",color:"white",fontSize:"15px",fontWeight:"700",cursor:(ok&&!saving)?"pointer":"default",opacity:saving?0.7:1}}>{saving?"Ukládám…":"Pokračovat 🌿"}</button>
+      </div>
+      </div>
+    </div>);
+}
+
+function Welcome({onStartRecovery}){
+  const [mode,setMode]=useState("choose"); // "choose" | "email" | "emailSent"
+  const [email,setEmail]=useState("");
+  const [emailSending,setEmailSending]=useState(false);
+  const [googleLoading,setGoogleLoading]=useState(false);
+  const [error,setError]=useState("");
 
   async function goGoogle(){
     if(googleLoading) return;
-    setGoogleLoading(true);
+    setGoogleLoading(true);setError("");
     try{
       var result=await signInWithPopup(auth,googleProvider);
       var uid=result.user.uid;
-      // Pokud profil ještě neexistuje, vytvoř ho z Google dat
       var existing = await getDoc(doc(db,"profiles",uid));
       if(!existing.exists()){
-        var displayName = (name.trim() || result.user.displayName || "Zahradník");
-        var location = loc.trim();
-        var email = result.user.email || "";
+        // Vytvoř minimální profil — uživatel vyplní zbytek přes "Dokončete profil"
         await setDoc(doc(db,"profiles",uid),{
-          displayName: displayName,
-          location: location,
-          email: email,
+          displayName: result.user.displayName || "",
+          location: "",
+          email: result.user.email || "",
           createdAt: Date.now()
         });
-        if(want.trim() && location){
-          await addDoc(collection(db,"plants"),{name:want.trim(),type:"demand",category:"",description:"Hledám tuto rostlinu — nabídněte mi výměnu!",lookingFor:"",location:location,photos:[],userId:uid,userName:displayName,color:"hsl("+Math.floor(Math.random()*360)+",50%,60%)",createdAt:Date.now(),status:"active"});
-        }
       }
       // onAuthStateChanged si přebere zbytek
     }catch(err){
       console.error("Google sign-in chyba:",err);
       if(err.code !== "auth/popup-closed-by-user" && err.code !== "auth/cancelled-popup-request"){
-        alert("Přihlášení přes Google se nezdařilo. "+(err&&err.message?err.message:""));
+        setError("Přihlášení přes Google se nezdařilo. "+(err&&err.message?err.message:""));
       }
       setGoogleLoading(false);
+    }
+  }
+
+  async function sendEmailLink(){
+    if(!email.trim() || emailSending) return;
+    if(!email.includes("@") || email.length < 5){
+      setError("Zadejte prosím platný e-mail.");
+      return;
+    }
+    setEmailSending(true);setError("");
+    try{
+      var actionCodeSettings = {
+        url: window.location.origin + "/?login=1",
+        handleCodeInApp: true
+      };
+      await sendSignInLinkToEmail(auth, email.trim(), actionCodeSettings);
+      try{ localStorage.setItem("odkopni_emailForSignIn", email.trim()); }catch(e){}
+      setMode("emailSent");
+    }catch(err){
+      console.error("sendSignInLinkToEmail error:",err);
+      var msg = "Nepodařilo se odeslat e-mail. ";
+      if(err && err.code === "auth/invalid-email") msg += "Zkontrolujte formát e-mailu.";
+      else if(err && (err.code === "auth/missing-android-pkg-name" || err.code === "auth/missing-continue-uri" || err.code === "auth/invalid-continue-uri" || err.code === "auth/unauthorized-continue-uri")) msg += "Konfigurační chyba — domain musí být v Authorized domains ve Firebase Console.";
+      else if(err && err.message) msg += err.message;
+      setError(msg);
+      setEmailSending(false);
     }
   }
 
@@ -793,30 +820,56 @@ function Welcome({onStartRecovery}){
         <h1 style={{fontSize:"36px",fontWeight:"800",fontFamily:"'Playfair Display', Georgia, serif",color:C.text,margin:"0 0 6px",letterSpacing:"-1px"}}>Odkopni</h1>
         <p style={{fontSize:"15px",color:C.sub,margin:"0 0 28px",lineHeight:"1.5"}}>Vyměňte přebytky ze zahrady<br/>s dalšími zahradníky</p>
 
-        <div style={{textAlign:"left",marginBottom:"14px"}}><label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Jak vám máme říkat? *</label><input value={name} onChange={function(e){setName(e.target.value);}} placeholder="Přezdívka nebo jméno" style={Object.assign({},INPUT_STYLE,{padding:"14px",borderRadius:"14px",fontSize:"15px"})} onFocus={function(e){e.target.style.borderColor=C.primary;}} onBlur={function(e){e.target.style.borderColor=C.border;}} /></div>
-        <div style={{textAlign:"left",marginBottom:"14px"}}><label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Odkud jste? *</label><input value={loc} onChange={function(e){setLoc(e.target.value);}} placeholder="Město nebo oblast" style={Object.assign({},INPUT_STYLE,{padding:"14px",borderRadius:"14px",fontSize:"15px"})} onFocus={function(e){e.target.style.borderColor=C.primary;}} onBlur={function(e){e.target.style.borderColor=C.border;}} /></div>
-        <div style={{textAlign:"left",marginBottom:"20px"}}><label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Po jaké rostlině pokukujete? <span style={{fontWeight:"400",color:C.muted}}>(volitelné)</span></label><PlantAC value={want} onChange={setWant} placeholder="např. Pivoňka, Hosta, Levandule..." /></div>
-
-        <button onClick={go} disabled={!ok||saving} style={{width:"100%",padding:"16px",border:"none",borderRadius:"14px",background:ok?"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")":"#e0e0e0",color:"white",fontSize:"16px",fontWeight:"700",cursor:ok?"pointer":"default",boxShadow:ok?"0 4px 20px "+C.primary+"30":"none",marginBottom:"12px"}}>{saving?"Připojuji...":"Jdeme na to! 🌿"}</button>
-
-        <div style={{display:"flex",alignItems:"center",gap:"10px",margin:"14px 0",color:C.muted,fontSize:"11px"}}>
-          <div style={{flex:1,height:"1px",background:C.border}}></div>
-          <span>nebo</span>
-          <div style={{flex:1,height:"1px",background:C.border}}></div>
-        </div>
-
-        <button onClick={goGoogle} disabled={googleLoading} style={{width:"100%",padding:"14px",border:"2px solid "+C.border,borderRadius:"14px",background:"white",fontSize:"14px",fontWeight:"600",color:C.text,cursor:googleLoading?"default":"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:"10px",opacity:googleLoading?0.6:1}}>
-          <I.Google s={18} /> {googleLoading?"Přihlašuji...":"Pokračovat přes Google"}
-        </button>
-
-        <p style={{fontSize:"11px",color:C.muted,marginTop:"18px",lineHeight:"1.5"}}>Anonymní vstup uloží data jen do tohoto prohlížeče.<br/>Přes Google si svůj účet zachováte i jinde.</p>
-
-        <div style={{marginTop:"24px",paddingTop:"20px",borderTop:"1px solid "+C.border}}>
-          <button onClick={startRecovery} style={{background:"none",border:"none",cursor:"pointer",color:C.primary,fontSize:"13px",fontWeight:"600",textDecoration:"underline",padding:"6px"}}>
-            Už jsem tu byl(a), ale nevidím své inzeráty →
+        {mode==="choose" && (<>
+          <button onClick={goGoogle} disabled={googleLoading} style={{width:"100%",padding:"16px",border:"none",borderRadius:"14px",background:"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")",color:"white",fontSize:"15px",fontWeight:"700",cursor:googleLoading?"default":"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:"10px",opacity:googleLoading?0.6:1,boxShadow:"0 4px 20px "+C.primary+"30",marginBottom:"12px"}}>
+            <I.Google s={20} /> {googleLoading?"Přihlašuji...":"Pokračovat přes Google"}
           </button>
-          <div style={{fontSize:"11px",color:C.muted,marginTop:"4px",lineHeight:"1.4"}}>Pomocí přezdívky, města a názvu jedné z vašich rostlin obnovíme přístup.</div>
-        </div>
+
+          <div style={{display:"flex",alignItems:"center",gap:"10px",margin:"14px 0",color:C.muted,fontSize:"11px"}}>
+            <div style={{flex:1,height:"1px",background:C.border}}></div>
+            <span>nemám Google účet</span>
+            <div style={{flex:1,height:"1px",background:C.border}}></div>
+          </div>
+
+          <button onClick={function(){setMode("email");setError("");}} style={{width:"100%",padding:"14px",border:"2px solid "+C.border,borderRadius:"14px",background:"white",fontSize:"14px",fontWeight:"600",color:C.text,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:"8px"}}>
+            ✉️ Pokračovat e-mailem
+          </button>
+
+          {error && (<div style={{marginTop:"14px",padding:"12px 14px",background:C.danger+"12",border:"1px solid "+C.danger+"40",borderRadius:"12px",fontSize:"13px",color:C.danger,lineHeight:"1.5"}}>⚠️ {error}</div>)}
+
+          <p style={{fontSize:"11px",color:C.muted,marginTop:"20px",lineHeight:"1.5"}}>Váš účet bude přístupný napříč zařízeními.</p>
+
+          <div style={{marginTop:"24px",paddingTop:"20px",borderTop:"1px solid "+C.border}}>
+            <button onClick={onStartRecovery} style={{background:"none",border:"none",cursor:"pointer",color:C.primary,fontSize:"13px",fontWeight:"600",textDecoration:"underline",padding:"6px"}}>
+              Už jsem tu byl(a), ale nevidím své inzeráty →
+            </button>
+            <div style={{fontSize:"11px",color:C.muted,marginTop:"4px",lineHeight:"1.4"}}>Pomocí přezdívky, města, rostliny a e-mailu obnovíme přístup.</div>
+          </div>
+        </>)}
+
+        {mode==="email" && (<>
+          <div style={{textAlign:"left",marginBottom:"14px"}}>
+            <label style={{display:"block",fontSize:"13px",fontWeight:"600",color:C.sub,marginBottom:"6px"}}>Váš e-mail *</label>
+            <input type="email" value={email} onChange={function(e){setEmail(e.target.value);}} placeholder="vase@adresa.cz" style={Object.assign({},INPUT_STYLE,{padding:"14px",borderRadius:"14px",fontSize:"15px"})} onFocus={function(e){e.target.style.borderColor=C.primary;}} onBlur={function(e){e.target.style.borderColor=C.border;}} />
+            <div style={{fontSize:"11px",color:C.muted,marginTop:"6px",lineHeight:"1.4"}}>Pošleme vám přihlašovací odkaz. Heslo si nemusíte pamatovat.</div>
+          </div>
+
+          {error && (<div style={{marginBottom:"14px",padding:"12px 14px",background:C.danger+"12",border:"1px solid "+C.danger+"40",borderRadius:"12px",fontSize:"13px",color:C.danger,lineHeight:"1.5"}}>⚠️ {error}</div>)}
+
+          <button onClick={sendEmailLink} disabled={!email.trim()||emailSending} style={{width:"100%",padding:"16px",border:"none",borderRadius:"14px",background:email.trim()?"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")":"#e0e0e0",color:"white",fontSize:"15px",fontWeight:"700",cursor:(email.trim()&&!emailSending)?"pointer":"default",opacity:emailSending?0.7:1,marginBottom:"10px"}}>{emailSending?"Odesílám…":"✉️ Poslat přihlašovací odkaz"}</button>
+
+          <button onClick={function(){setMode("choose");setError("");}} style={{background:"none",border:"none",cursor:"pointer",color:C.sub,fontSize:"12px",padding:"6px"}}>← Zpět</button>
+        </>)}
+
+        {mode==="emailSent" && (<>
+          <div style={{fontSize:"56px",marginBottom:"8px"}}>📬</div>
+          <h2 style={{margin:"0 0 8px",fontSize:"20px",fontWeight:"700",color:C.text}}>E-mail odeslán</h2>
+          <p style={{margin:"0 0 14px",fontSize:"13px",color:C.sub,lineHeight:"1.5"}}>Poslali jsme přihlašovací odkaz na <strong>{email}</strong>. Otevřete e-mail a klikněte na odkaz <strong>v běžném prohlížeči</strong> (Chrome, Safari).</p>
+          <div style={{background:"#fff8e8",border:"1px solid #f0d090",borderRadius:"12px",padding:"12px 14px",margin:"0 0 16px",fontSize:"12.5px",color:"#7a5a20",lineHeight:"1.5",textAlign:"left"}}>
+            <strong>💡 Tip:</strong> Pokud e-mail nepřišel během minuty, zkontrolujte složku spam. Odesílatel je <em>noreply@odkopni.firebaseapp.com</em>.
+          </div>
+          <button onClick={function(){setMode("choose");setEmail("");setError("");}} style={{width:"100%",padding:"14px",border:"2px solid "+C.border,borderRadius:"14px",background:"white",color:C.sub,fontSize:"14px",fontWeight:"600",cursor:"pointer"}}>Zavřít</button>
+        </>)}
       </div>
       </div>
     </div>);
@@ -937,6 +990,171 @@ export default function App(){
   const [bannerDismissed,setBannerDismissed]=useState(function(){try{return localStorage.getItem("odkopni_banner_dismissed")==="1";}catch(e){return false;}});
   const [favs,setFavs]=useState(function(){try{return JSON.parse(localStorage.getItem("odkopni_favs")||"[]");}catch(e){return[];}});
   const [showRecovery,setShowRecovery]=useState(false);
+  const [emailLinkState,setEmailLinkState]=useState(null); // null | "processing" | "needEmail" | "done" | {error}
+  const [emailLinkProgress,setEmailLinkProgress]=useState({phase:"",done:0,total:0});
+  const [emailLinkEmailInput,setEmailLinkEmailInput]=useState("");
+
+  // ── Detekce příchodu z email-link auth ──
+  useEffect(function(){
+    if(typeof window === "undefined") return;
+    var href = window.location.href;
+    if(!isSignInWithEmailLink(auth, href)) return;
+    // Tohle je email link! Spustíme příhlášení.
+    var savedEmail = "";
+    try{ savedEmail = localStorage.getItem("odkopni_emailForSignIn") || ""; }catch(e){}
+    if(savedEmail){
+      processEmailLink(savedEmail, href);
+    }else{
+      // Email v localStorage neexistuje — uživatel klikl v jiném prohlížeči/zařízení.
+      // Zeptáme se znovu.
+      setEmailLinkState("needEmail");
+    }
+  },[]);
+
+  async function processEmailLink(emailValue, href){
+    setEmailLinkState("processing");
+    setEmailLinkProgress({phase:"Přihlašuji",done:0,total:1});
+    try{
+      var result = await signInWithEmailLink(auth, emailValue, href);
+      var newUid = result.user.uid;
+      var normalizedEmail = emailValue.trim().toLowerCase();
+
+      // Hned po přihlášení vyčistíme URL od auth parametrů, ať se to neopakovalo při refreshi
+      try{
+        var cleanUrl = window.location.origin + window.location.pathname;
+        window.history.replaceState({}, document.title, cleanUrl);
+      }catch(e){}
+
+      // Vyčistit email z localStorage
+      try{ localStorage.removeItem("odkopni_emailForSignIn"); }catch(e){}
+
+      // Najít starý profil podle recoveryClaim == email
+      setEmailLinkProgress({phase:"Hledám profil",done:0,total:1});
+      var profSnap = await getDocs(collection(db,"profiles"));
+      var oldProfileDoc = null;
+      profSnap.docs.forEach(function(d){
+        var data = d.data();
+        if(data.recoveryClaim && data.recoveryClaim === normalizedEmail && d.id !== newUid){
+          // Můžeme najít víc takových; vezmeme nejnovější podle recoveryClaimAt
+          if(!oldProfileDoc || (data.recoveryClaimAt||0) > (oldProfileDoc.data.recoveryClaimAt||0)){
+            oldProfileDoc = {id:d.id, data:data};
+          }
+        }
+      });
+
+      if(!oldProfileDoc){
+        // Žádný profil s tímto recoveryClaim → uživatel se právě poprvé přihlásil emailem bez recovery.
+        // V téhle situaci necháme profil tak jak je (případně si ho dovytvoří přes ProfileEdit).
+        // Pokud profil pro newUid neexistuje, založíme prázdný se zadaným emailem.
+        var ownSnap = await getDoc(doc(db,"profiles",newUid));
+        if(!ownSnap.exists()){
+          await setDoc(doc(db,"profiles",newUid),{
+            displayName:"",
+            location:"",
+            email:emailValue,
+            createdAt:Date.now()
+          });
+        }
+        setEmailLinkState("done");
+        // Po krátké chvíli zavřeme overlay
+        setTimeout(function(){
+          setEmailLinkState(null);
+          window.location.reload();
+        }, 1200);
+        return;
+      }
+
+      // Bezpečnostní check — zkontrolovat, že recoveryClaim není starší než 24h
+      if(oldProfileDoc.data.recoveryClaimAt && (Date.now() - oldProfileDoc.data.recoveryClaimAt) > 24*60*60*1000){
+        setEmailLinkState({error:"Odkaz pro obnovení vypršel. Vraťte se a vyžádejte si nový."});
+        return;
+      }
+
+      var oldUid = oldProfileDoc.id;
+
+      // Označit recoveryTo (aby rules dovolily přepis)
+      setEmailLinkProgress({phase:"Připravuji obnovení",done:0,total:1});
+      await updateDoc(doc(db,"profiles",oldUid),{recoveryTo:newUid,recoveryAt:Date.now()});
+
+      // Načíst plants a chats starého UID
+      var plantQ = query(collection(db,"plants"),where("userId","==",oldUid));
+      var plantSnap = await getDocs(plantQ);
+      var totalPlants = plantSnap.docs.length;
+      setEmailLinkProgress({phase:"Převod inzerátů",done:0,total:totalPlants});
+      for(var i=0;i<plantSnap.docs.length;i++){
+        await updateDoc(doc(db,"plants",plantSnap.docs[i].id),{userId:newUid});
+        setEmailLinkProgress({phase:"Převod inzerátů",done:i+1,total:totalPlants});
+      }
+
+      var chatQ = query(collection(db,"chats"),where("participants","array-contains",oldUid));
+      var chatSnap = await getDocs(chatQ);
+      var totalChats = chatSnap.docs.length;
+      setEmailLinkProgress({phase:"Převod chatů",done:0,total:totalChats});
+      for(var j=0;j<chatSnap.docs.length;j++){
+        var ch = chatSnap.docs[j];
+        var chData = ch.data();
+        var newParticipants = (chData.participants||[]).map(function(p){return p===oldUid?newUid:p;});
+        var newLastSenderId = chData.lastSenderId===oldUid ? newUid : chData.lastSenderId;
+        var newReadBy = (chData.readBy||[]).map(function(p){return p===oldUid?newUid:p;});
+        await updateDoc(doc(db,"chats",ch.id),{
+          participants:newParticipants,
+          lastSenderId:newLastSenderId,
+          readBy:newReadBy
+        });
+        setEmailLinkProgress({phase:"Převod chatů",done:j+1,total:totalChats});
+      }
+
+      // Vytvořit nový profil pro newUid
+      setEmailLinkProgress({phase:"Aktualizace profilu",done:0,total:1});
+      var newProfileData = {
+        displayName: oldProfileDoc.data.displayName || "",
+        location: oldProfileDoc.data.location || "",
+        email: emailValue,
+        createdAt: oldProfileDoc.data.createdAt || Date.now()
+      };
+      await setDoc(doc(db,"profiles",newUid), newProfileData, {merge:true});
+
+      // Log do recoveryLog
+      try{
+        await addDoc(collection(db,"recoveryLog"),{
+          oldUid:oldUid,
+          newUid:newUid,
+          email:emailValue,
+          displayName:oldProfileDoc.data.displayName||"",
+          location:oldProfileDoc.data.location||"",
+          plantsCount:totalPlants,
+          chatsCount:totalChats,
+          timestamp:Date.now(),
+          userAgent:(typeof navigator!=="undefined"?navigator.userAgent:"").slice(0,200)
+        });
+      }catch(e){console.warn("recoveryLog write failed",e);}
+
+      // Smazat starý profil
+      try{await deleteDoc(doc(db,"profiles",oldUid));}catch(e){console.warn("delete old profile failed",e);}
+
+      // Vymazat cache
+      try{
+        localStorage.removeItem("odkopni_plants_cache");
+        localStorage.removeItem("odkopni_profiles_cache");
+      }catch(e){}
+
+      setEmailLinkProgress({phase:"Hotovo",done:1,total:1});
+      setEmailLinkState("done");
+      // Po krátké chvíli reload
+      setTimeout(function(){
+        setEmailLinkState(null);
+        window.location.reload();
+      }, 1500);
+    }catch(err){
+      console.error("processEmailLink error:",err);
+      var msg = "Při přihlašování nastala chyba. ";
+      if(err && err.code === "auth/invalid-action-code") msg += "Odkaz je neplatný nebo už byl použit. Vyžádejte si nový.";
+      else if(err && err.code === "auth/expired-action-code") msg += "Odkaz vypršel. Vyžádejte si nový.";
+      else if(err && err.code === "auth/invalid-email") msg += "Email neodpovídá tomu, na který byl odkaz odeslán.";
+      else if(err && err.message) msg += err.message;
+      setEmailLinkState({error:msg});
+    }
+  }
 
   useEffect(function(){var unsub=onAuthStateChanged(auth,async function(u){setUser(u);if(u){try{var profSnap=await getDoc(doc(db,"profiles",u.uid));if(profSnap.exists())setProfile(profSnap.data());else setProfile(null);}catch(e){}}else{setProfile(null);}});return unsub;},[]);
 
@@ -1056,8 +1274,60 @@ export default function App(){
   var hasMyPosts = user && plants.some(function(p){return p.userId===user.uid;});
 
   if(user===undefined)return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:C.bg}}><div style={{fontSize:"36px"}}>🌱</div></div>;
+
+  // Email link processing overlays
+  if(emailLinkState === "processing"){
+    return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(160deg, "+C.bg+" 0%, #e8f0ea 50%, "+C.bg+" 100%)",padding:"24px"}}>
+      <div style={{background:"white",borderRadius:"20px",padding:"32px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)",textAlign:"center",maxWidth:"400px",width:"100%"}}>
+        <div style={{fontSize:"42px",marginBottom:"12px"}}>⏳</div>
+        <h2 style={{margin:"0 0 8px",fontSize:"20px",fontWeight:"700",color:C.text,fontFamily:"'Playfair Display', Georgia, serif"}}>Přihlašuji…</h2>
+        <p style={{margin:"0 0 16px",fontSize:"13px",color:C.sub}}>{emailLinkProgress.phase}{emailLinkProgress.total>1?(" ("+emailLinkProgress.done+"/"+emailLinkProgress.total+")"):""}</p>
+        <div style={{background:C.bg,borderRadius:"8px",overflow:"hidden",height:"6px"}}>
+          <div style={{background:C.primary,height:"100%",width:(emailLinkProgress.total>0?(emailLinkProgress.done/emailLinkProgress.total*100)+"%":"0%"),transition:"width 0.3s"}}></div>
+        </div>
+        <p style={{margin:"16px 0 0",fontSize:"11px",color:C.muted}}>Prosím nezavírejte tuto stránku.</p>
+      </div>
+    </div>;
+  }
+  if(emailLinkState === "needEmail"){
+    return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(160deg, "+C.bg+" 0%, #e8f0ea 50%, "+C.bg+" 100%)",padding:"24px"}}>
+      <div style={{background:"white",borderRadius:"20px",padding:"32px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)",maxWidth:"400px",width:"100%"}}>
+        <div style={{fontSize:"42px",marginBottom:"8px",textAlign:"center"}}>📧</div>
+        <h2 style={{margin:"0 0 8px",fontSize:"20px",fontWeight:"700",color:C.text,fontFamily:"'Playfair Display', Georgia, serif",textAlign:"center"}}>Potvrďte e-mail</h2>
+        <p style={{margin:"0 0 16px",fontSize:"13px",color:C.sub,textAlign:"center",lineHeight:"1.5"}}>Otevřel(a) jste přihlašovací odkaz na jiném zařízení nebo v jiném prohlížeči. Zadejte e-mail, na který byl odkaz odeslán.</p>
+        <input type="email" value={emailLinkEmailInput} onChange={function(e){setEmailLinkEmailInput(e.target.value);}} placeholder="vase@adresa.cz" style={Object.assign({},INPUT_STYLE,{marginBottom:"12px",fontSize:"15px",padding:"14px",borderRadius:"14px"})} />
+        <button onClick={function(){if(emailLinkEmailInput.trim()){processEmailLink(emailLinkEmailInput.trim(), window.location.href);}}} disabled={!emailLinkEmailInput.trim()} style={{width:"100%",padding:"14px",border:"none",borderRadius:"14px",background:emailLinkEmailInput.trim()?"linear-gradient(135deg, "+C.primary+", "+C.primaryDark+")":"#e0e0e0",color:"white",fontSize:"15px",fontWeight:"700",cursor:emailLinkEmailInput.trim()?"pointer":"default"}}>Pokračovat</button>
+      </div>
+    </div>;
+  }
+  if(emailLinkState === "done"){
+    return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(160deg, "+C.bg+" 0%, #e8f0ea 50%, "+C.bg+" 100%)",padding:"24px"}}>
+      <div style={{background:"white",borderRadius:"20px",padding:"32px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)",textAlign:"center",maxWidth:"400px",width:"100%"}}>
+        <div style={{fontSize:"56px",marginBottom:"8px"}}>🎉</div>
+        <h2 style={{margin:"0 0 8px",fontSize:"22px",fontWeight:"700",color:C.text,fontFamily:"'Playfair Display', Georgia, serif"}}>Přihlášeno!</h2>
+        <p style={{margin:"0",fontSize:"14px",color:C.sub}}>Načítám vaše údaje…</p>
+      </div>
+    </div>;
+  }
+  if(emailLinkState && emailLinkState.error){
+    return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(160deg, "+C.bg+" 0%, #e8f0ea 50%, "+C.bg+" 100%)",padding:"24px"}}>
+      <div style={{background:"white",borderRadius:"20px",padding:"32px",boxShadow:"0 8px 32px rgba(0,0,0,0.06)",maxWidth:"400px",width:"100%"}}>
+        <div style={{fontSize:"42px",marginBottom:"8px",textAlign:"center"}}>⚠️</div>
+        <h2 style={{margin:"0 0 8px",fontSize:"20px",fontWeight:"700",color:C.danger,fontFamily:"'Playfair Display', Georgia, serif",textAlign:"center"}}>Chyba přihlášení</h2>
+        <p style={{margin:"0 0 16px",fontSize:"13px",color:C.sub,textAlign:"center",lineHeight:"1.5"}}>{emailLinkState.error}</p>
+        <button onClick={function(){setEmailLinkState(null);try{var cleanUrl = window.location.origin + window.location.pathname;window.history.replaceState({}, document.title, cleanUrl);}catch(e){}window.location.reload();}} style={{width:"100%",padding:"14px",border:"none",borderRadius:"14px",background:C.primary,color:"white",fontSize:"15px",fontWeight:"700",cursor:"pointer"}}>Zpět na začátek</button>
+      </div>
+    </div>;
+  }
+
   if(!user)return <Welcome onStartRecovery={function(){setShowRecovery(true);}} />;
   if(showRecovery)return <RecoverAccount onBack={function(){setShowRecovery(false);}} onDone={function(){window.location.reload();}} />;
+  // Profil neexistuje vůbec, ale user je email/Google přihlášen → ukázat ProfileSetup
+  if(!profile && user && !user.isAnonymous)return <ProfileSetup user={user} onDone={function(p){setProfile(p);}} />;
+  // Profil existuje ale chybí klíčová pole (displayName nebo location) → ProfileSetup
+  if(profile && user && !user.isAnonymous && (!profile.displayName || !profile.displayName.trim() || !profile.location || !profile.location.trim())){
+    return <ProfileSetup user={user} initialProfile={profile} onDone={function(p){setProfile(p);}} />;
+  }
   if(!profile)return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:C.bg,flexDirection:"column",gap:"12px"}}><div style={{fontSize:"36px"}}>🌱</div><div style={{color:C.muted,fontSize:"14px"}}>Načítám profil...</div><button onClick={function(){setShowRecovery(true);}} style={{marginTop:"8px",background:"none",border:"none",color:C.primary,fontSize:"13px",fontWeight:"600",textDecoration:"underline",cursor:"pointer"}}>Mám problém s účtem →</button></div>;
   if(activeChat)return <ChatView chat={activeChat} user={user} onBack={function(){setActiveChat(null);}} onMarkRead={markRead} />;
 

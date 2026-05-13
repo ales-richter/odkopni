@@ -1,5 +1,11 @@
 import { initializeApp } from "firebase/app";
-import { getAuth, signInAnonymously, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, linkWithPopup } from "firebase/auth";
+import {
+  getAuth,
+  signInAnonymously, onAuthStateChanged,
+  GoogleAuthProvider, signInWithPopup, linkWithPopup,
+  sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink,
+  EmailAuthProvider, linkWithCredential
+} from "firebase/auth";
 import {
   getFirestore, collection, addDoc, getDocs, getDoc, updateDoc,
   deleteDoc, doc, query, where, orderBy, onSnapshot, setDoc
@@ -25,6 +31,8 @@ googleProvider.setCustomParameters({ prompt: "select_account" });
 export {
   signInAnonymously, onAuthStateChanged,
   signInWithPopup, linkWithPopup,
+  sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink,
+  EmailAuthProvider, linkWithCredential,
   collection, addDoc, getDocs, getDoc, updateDoc,
   deleteDoc, doc, query, where, orderBy, onSnapshot, setDoc
 };

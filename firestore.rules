@@ -13,7 +13,6 @@ service cloud.firestore {
     match /plants/{plantId} {
       allow read: if true;
       allow create: if request.auth != null;
-      // Update: buď owner, nebo recovery target který přepisuje userId
       allow update: if request.auth != null
         && (
           resource.data.userId == request.auth.uid
@@ -35,7 +34,6 @@ service cloud.firestore {
     match /chats/{chatId} {
       allow read: if request.auth != null;
       allow create: if request.auth != null;
-      // Update povolen, pokud jsem účastník, nebo pokud jsem recovery target některého z účastníků
       allow update: if request.auth != null
         && (
           request.auth.uid in resource.data.participants
@@ -51,18 +49,18 @@ service cloud.firestore {
         && request.auth.uid in resource.data.participants;
     }
 
-    // ── Profily — kdokoliv čte, write jen vlastní + správa recovery flagu ──
+    // ── Profily ──
     match /profiles/{profileId} {
       allow read: if true;
-      // Vlastní profil: může psát kdokoliv (svůj)
-      // Cizí profil: může nastavit pouze pole recoveryTo (a recoveryAt) a smazat jej, pokud je sám cílem recovery
       allow create: if request.auth != null && request.auth.uid == profileId;
       allow update: if request.auth != null
         && (
           // Vlastní profil
           request.auth.uid == profileId
+          // Anebo: zápis recoveryClaim na cizí profil (krok 1 recovery z FB browseru)
+          || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['recoveryClaim','recoveryClaimAt'])
+          // Anebo: zápis recoveryTo na cizí profil (krok 2 — po kliknutí v email linku)
           || (
-            // Cizí profil: povolíme nastavení recoveryTo na mě (řízeno klientem v recovery flow)
             request.resource.data.recoveryTo == request.auth.uid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['recoveryTo','recoveryAt'])
           )
@@ -74,7 +72,7 @@ service cloud.firestore {
         );
     }
 
-    // ── Recovery log — read jen vlastní záznamy, write kdokoliv přihlášený ──
+    // ── Recovery log — append-only, audit ──
     match /recoveryLog/{logId} {
       allow create: if request.auth != null
         && request.resource.data.newUid == request.auth.uid;

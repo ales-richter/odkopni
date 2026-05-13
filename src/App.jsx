@@ -1320,8 +1320,10 @@ export default function App(){
     </div>;
   }
 
-  if(!user)return <Welcome onStartRecovery={function(){setShowRecovery(true);}} />;
+  // Recovery má přednost před vším — i když uživatel není přihlášen
   if(showRecovery)return <RecoverAccount onBack={function(){setShowRecovery(false);}} onDone={function(){window.location.reload();}} />;
+
+  if(!user)return <Welcome onStartRecovery={function(){setShowRecovery(true);}} />;
   // Profil neexistuje vůbec, ale user je email/Google přihlášen → ukázat ProfileSetup
   if(!profile && user && !user.isAnonymous)return <ProfileSetup user={user} onDone={function(p){setProfile(p);}} />;
   // Profil existuje ale chybí klíčová pole (displayName nebo location) → ProfileSetup

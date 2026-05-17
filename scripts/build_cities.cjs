@@ -88,12 +88,30 @@ const skCities = processSkGeojson(INPUT_SK);
 console.log("ČR obcí:", czCities.length);
 console.log("SR obcí:", skCities.length);
 
-// Priorita typů pro řešení duplicit (větší = lepší)
+// Některá slovenská města jsou všeobecně známá (větší než kterákoliv CZ obec
+// se stejným jménem). Pro tato preferujeme SK i v případě CZ-vs-SK kolize.
+const skMajorCities = new Set([
+  "bratislava",
+  "kosice",      // > 200k obyvatel; v ČR jen vesnice s ~200
+  "presov",      // > 80k
+  "zilina",      // > 80k; v ČR vesnička 250 obyvatel
+  "banska bystrica",
+  "nitra",
+  "trnava",      // > 60k; v ČR malá obec
+  "martin",
+  "trencin",
+  "poprad",
+  "humenne",
+  "bardejov"
+]);
+
+// Priorita typů SK obcí pro řešení duplicit v rámci SK (větší = lepší)
 const typeRank = { city: 4, town: 3, village: 2, hamlet: 1 };
 
 // Slouči, řeš duplicity:
-// 1) Stejný normalized name napříč zeměmi: preferujeme stát s větším městem podle typu
-// 2) Stejný normalized name v rámci jednoho státu: preferujeme kratší název (Adamov < Adamov u Mostu)
+// 1) CZ vs SK: pokud SK je major city → preferujeme SK, jinak CZ
+// 2) Dvě CZ se stejným jménem → preferujeme kratší (např. "Adamov" < "Adamov nad Orlicí")
+// 3) Dvě SK se stejným jménem → preferujeme vyšší typeRank
 const all = [...czCities, ...skCities];
 const lookupMap = {};
 for (const city of all) {
@@ -104,18 +122,29 @@ for (const city of all) {
     lookupMap[norm] = city;
     continue;
   }
-  // Kolize. Pravidla:
-  // a) Pokud má jeden vyšší typeRank (jen SK má type) → tomu dáme přednost
-  const newRank = typeRank[city.type] || 0;
-  const oldRank = typeRank[existing.type] || 0;
-  if (newRank > oldRank) {
-    lookupMap[norm] = city;
+  // Kolize. Pravidla podle země:
+  // a) CZ vs SK
+  if (city.country !== existing.country) {
+    const isSkMajor = skMajorCities.has(norm);
+    if (isSkMajor) {
+      // Major SK město vyhrává
+      if (city.country === "SK") lookupMap[norm] = city;
+      // jinak existing je SK a nový je CZ → ponecháme existing
+    } else {
+      // Jinak CZ vyhrává
+      if (city.country === "CZ") lookupMap[norm] = city;
+    }
     continue;
   }
-  if (newRank < oldRank) continue;
-  // b) Pokud má jeden kratší jméno (méně suffixu) → preferujeme ho
-  if (city.name.length < existing.name.length) {
-    lookupMap[norm] = city;
+  // b) Stejná země
+  if (city.country === "SK") {
+    const newRank = typeRank[city.type] || 0;
+    const oldRank = typeRank[existing.type] || 0;
+    if (newRank > oldRank) lookupMap[norm] = city;
+    else if (newRank === oldRank && city.name.length < existing.name.length) lookupMap[norm] = city;
+  } else {
+    // CZ: preferujeme kratší jméno
+    if (city.name.length < existing.name.length) lookupMap[norm] = city;
   }
 }
 

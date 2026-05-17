@@ -8,6 +8,7 @@ import {
   collection, addDoc, getDocs, getDoc, updateDoc, deleteDoc,
   doc, query, where, orderBy, onSnapshot, setDoc
 } from "./firebase";
+import cityData from "./data/cities.json";
 
 // ============================================================
 // 🌱 ODKOPNI — výměnný marketplace pro zahradní trvalky
@@ -18,6 +19,55 @@ import {
 // Profily vytvořené po tomto datu (s povinným emailem) lze obnovit pouze
 // pomocí emailu shodného s tím v profilu.
 var RECOVERY_AMNESTY_END = 1780394108578; // 2. června 2026
+
+// ============================================================
+// 🗺️ Geo helpers — vyhledávání souřadnic města + Haversine
+// ============================================================
+// cityData je pole [normalized_name, lat, lng, country_code]
+// Lazy-build Map pro rychlý lookup
+var _cityMap = null;
+function _getCityMap(){
+  if(_cityMap) return _cityMap;
+  _cityMap = new Map();
+  for(var i=0;i<cityData.length;i++){
+    var entry = cityData[i];
+    _cityMap.set(entry[0], {lat:entry[1], lng:entry[2], country:entry[3]});
+  }
+  return _cityMap;
+}
+
+// Normalizace textu — lowercase, bez diakritiky, ořezat
+function normalizeCityName(str){
+  return (str||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").trim();
+}
+
+// Najít souřadnice města podle textu. Vrátí {lat, lng, country} nebo null.
+// Postup: 1) exact match, 2) odstranění čísla/pomlčky/čárky, 3) první slovo
+function findCityCoords(text){
+  if(!text) return null;
+  var map = _getCityMap();
+  var n = normalizeCityName(text);
+  if(map.has(n)) return map.get(n);
+  // Odstranit suffix typu " 1", " - cast", ", okres ..."
+  var stripped = n.replace(/[\s\-,/].*$/, "").trim();
+  if(stripped && stripped !== n && map.has(stripped)) return map.get(stripped);
+  // První slovo
+  var firstWord = n.split(/[\s\-,/]/)[0].trim();
+  if(firstWord && firstWord !== n && firstWord !== stripped && map.has(firstWord)) return map.get(firstWord);
+  return null;
+}
+
+// Haversine vzdálenost dvou bodů v km
+function haversineKm(lat1, lng1, lat2, lng2){
+  var R = 6371;
+  var toRad = function(deg){return (deg*Math.PI)/180;};
+  var dLat = toRad(lat2-lat1);
+  var dLng = toRad(lng2-lng1);
+  var a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)*Math.sin(dLng/2);
+  var c = 2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R*c;
+}
+
 
 const CZ_PERENNIALS = [
   "Achillea millefolium – Řebříček obecný","Aconitum napellus – Oměj šalamounek","Agastache foeniculum – Agastache fenyklová",
@@ -346,12 +396,17 @@ function AddForm({user,profile,onClose,onAdd,onUpdate,mode,editPlant}){
     if(!ok||saving)return;
     setSaving(true);setError("");
     try{
+      // Geokódování — pokud lokaci poznáme, uložíme i lat/lng (pro radius filter)
+      var locTrimmed = f.location.trim();
+      var coords = findCityCoords(locTrimmed);
       if(isEdit){
-        var upd={name:f.name.trim(),category:f.category,description:f.description.trim(),lookingFor:f.lookingFor.trim(),location:f.location.trim(),photos:photos};
+        var upd={name:f.name.trim(),category:f.category,description:f.description.trim(),lookingFor:f.lookingFor.trim(),location:locTrimmed,photos:photos};
+        if(coords){ upd.lat = coords.lat; upd.lng = coords.lng; }
         await updateDoc(doc(db,"plants",editPlant.id),upd);
         onUpdate(Object.assign({},editPlant,upd));
       }else{
-        var plantData={name:f.name.trim(),category:f.category,description:f.description.trim(),lookingFor:f.lookingFor.trim(),location:f.location.trim(),photos:photos,type:mode,userId:user.uid,userName:(profile&&profile.displayName)||"Anonym",color:"hsl("+Math.floor(Math.random()*360)+",50%,60%)",createdAt:Date.now(),status:"active"};
+        var plantData={name:f.name.trim(),category:f.category,description:f.description.trim(),lookingFor:f.lookingFor.trim(),location:locTrimmed,photos:photos,type:mode,userId:user.uid,userName:(profile&&profile.displayName)||"Anonym",color:"hsl("+Math.floor(Math.random()*360)+",50%,60%)",createdAt:Date.now(),status:"active"};
+        if(coords){ plantData.lat = coords.lat; plantData.lng = coords.lng; }
         var docRef=await addDoc(collection(db,"plants"),plantData);
         onAdd(Object.assign({},plantData,{id:docRef.id}));
       }

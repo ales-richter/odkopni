@@ -271,8 +271,15 @@ function CommunityBar({profiles}){
 }
 
 // ── Plant Card ──
-function PlantCard({plant,onClick,isFav,onToggleFav}){
+function PlantCard({plant,onClick,isFav,onToggleFav,distanceKm}){
   var hasP=plant.photos&&plant.photos.length>0,dn=(plant.name||"").split(" – "),st=STATUSES[plant.status]||STATUSES.active,isDemand=plant.type==="demand";
+  // Formátování vzdálenosti pro display
+  var distLabel = null;
+  if(distanceKm != null){
+    if(distanceKm < 1) distLabel = "< 1 km";
+    else if(distanceKm < 10) distLabel = distanceKm.toFixed(1).replace(".",",") + " km";
+    else distLabel = Math.round(distanceKm) + " km";
+  }
   return(
     <div onClick={onClick} style={{background:C.card,borderRadius:"16px",overflow:"hidden",cursor:"pointer",transition:"all 0.3s cubic-bezier(0.23,1,0.32,1)",boxShadow:"0 2px 12px rgba(0,0,0,0.05)",border:"1px solid "+(isDemand?C.accent+"40":C.border)}} onMouseEnter={function(e){e.currentTarget.style.transform="translateY(-3px)";e.currentTarget.style.boxShadow="0 8px 28px rgba(0,0,0,0.1)";}} onMouseLeave={function(e){e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="0 2px 12px rgba(0,0,0,0.05)";}}>
       <div style={{height:"140px",display:"flex",alignItems:"center",justifyContent:"center",position:"relative",overflow:"hidden",background:hasP?"#eee":"linear-gradient(135deg, "+(plant.color||C.primary)+"20, "+(plant.color||C.primary)+"40)"}}>
@@ -291,7 +298,7 @@ function PlantCard({plant,onClick,isFav,onToggleFav}){
         <p style={{margin:"0 0 8px",fontSize:"12px",color:C.muted,lineHeight:"1.4",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>{plant.description}</p>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div style={{display:"flex",alignItems:"center",gap:"5px"}}><div style={{width:"20px",height:"20px",borderRadius:"50%",background:"linear-gradient(135deg, "+(plant.color||C.primary)+", "+(plant.color||C.primary)+"88)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"9px",color:"white",fontWeight:"700"}}>{(plant.userName||"?")[0]}</div><span style={{fontSize:"11px",color:C.muted}}>{plant.userName}</span></div>
-          <div style={{display:"flex",alignItems:"center",gap:"3px"}}><I.Pin s={11} c={C.muted} /><span style={{fontSize:"10px",color:C.muted}}>{plant.location}</span></div>
+          <div style={{display:"flex",alignItems:"center",gap:"3px"}}><I.Pin s={11} c={C.muted} /><span style={{fontSize:"10px",color:C.muted}}>{plant.location}</span>{distLabel && <span style={{fontSize:"10px",color:C.primary,fontWeight:"700",marginLeft:"4px",background:C.primary+"15",padding:"1px 6px",borderRadius:"8px"}}>{distLabel}</span>}</div>
         </div>
         {plant.lookingFor&&(<div style={{marginTop:"8px",padding:"6px 10px",background:C.primary+"08",borderRadius:"8px",fontSize:"11px",color:C.sub}}><span style={{fontWeight:"600",color:C.primary}}>Hledám:</span> {plant.lookingFor}</div>)}
       </div>
@@ -1630,6 +1637,15 @@ export default function App(){
   });
   if(sort==="oldest")filtered=filtered.slice().reverse();
 
+  // Pokud je radius aktivní, řadíme od nejbližšího k nejvzdálenějšímu (ignorujeme newest/oldest)
+  if(radiusKm && radiusCenter){
+    filtered = filtered.slice().sort(function(a,b){
+      var da = (a.lat!=null && a.lng!=null) ? haversineKm(radiusCenter.lat, radiusCenter.lng, a.lat, a.lng) : 999999;
+      var db = (b.lat!=null && b.lng!=null) ? haversineKm(radiusCenter.lat, radiusCenter.lng, b.lat, b.lng) : 999999;
+      return da - db;
+    });
+  }
+
   // Statistiky
   var totalOffers = plants.filter(function(p){return (p.type||"offer")==="offer";}).length;
   var totalDemands = plants.filter(function(p){return p.type==="demand";}).length;
@@ -1857,7 +1873,14 @@ export default function App(){
         {!filtered.length?(
           <div style={{textAlign:"center",padding:"48px 20px",color:C.muted}}><I.Leaf s={44} c={C.border} /><p style={{fontSize:"15px",fontWeight:"500",marginTop:"12px",color:C.sub}}>{view==="my"?"Zatím nemáte žádné příspěvky":view==="favs"?"Žádné oblíbené":(search||typeFilter!=="all"||radiusKm)?"Nic neodpovídá filtrům":"Žádné příspěvky"}</p></div>
         ):(
-          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill, minmax(270px, 1fr))",gap:"14px"}}>{filtered.map(function(p,i){return(<div key={p.id} style={{animation:"slideUp 0.35s ease "+(i*0.04)+"s both"}}><PlantCard plant={p} onClick={function(){setSel(p);}} isFav={favs.includes(p.id)} onToggleFav={toggleFav} /></div>);})}</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill, minmax(270px, 1fr))",gap:"14px"}}>{filtered.map(function(p,i){
+            // Spočítat vzdálenost, pokud je radius aktivní a inzerát má coords
+            var dist = null;
+            if(radiusKm && radiusCenter && p.lat != null && p.lng != null){
+              dist = haversineKm(radiusCenter.lat, radiusCenter.lng, p.lat, p.lng);
+            }
+            return(<div key={p.id} style={{animation:"slideUp 0.35s ease "+(i*0.04)+"s both"}}><PlantCard plant={p} onClick={function(){setSel(p);}} isFav={favs.includes(p.id)} onToggleFav={toggleFav} distanceKm={dist} /></div>);
+          })}</div>
         )}
       </main>
 

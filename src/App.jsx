@@ -1186,6 +1186,7 @@ export default function App(){
   const [cat,setCat]=useState("Vše");const [view,setView]=useState("browse");const [sort,setSort]=useState("newest");
   const [typeFilter,setTypeFilter]=useState("all"); // "all" | "offer" | "demand"
   const [cityFilter,setCityFilter]=useState("");
+  const [radiusKm,setRadiusKm]=useState(null); // null = bez omezení, jinak km (10/25/50/100)
   const [unreadCount,setUnreadCount]=useState(0);
   const [allProfiles,setAllProfiles]=useState([]);
   const [bannerDismissed,setBannerDismissed]=useState(function(){try{return localStorage.getItem("odkopni_banner_dismissed")==="1";}catch(e){return false;}});
@@ -1595,6 +1596,13 @@ export default function App(){
   var month=new Date().getMonth()+1,seasonalMsg=SEASONAL[month];
 
   // Filtrování s typeFilter a cityFilter
+  // Pro radius filter: zjistíme centrum (z cityFilter, fallback profile.location)
+  var radiusCenter = null;
+  if(radiusKm){
+    var centerText = (cityFilter && cityFilter.trim()) || (profile && profile.location) || "";
+    if(centerText) radiusCenter = findCityCoords(centerText);
+  }
+
   var filtered=plants.filter(function(p){
     var s=search.toLowerCase();
     var ms=!s||(p.name&&p.name.toLowerCase().includes(s))||(p.description&&p.description.toLowerCase().includes(s))||(p.lookingFor||"").toLowerCase().includes(s)||(p.location&&p.location.toLowerCase().includes(s));
@@ -1602,7 +1610,17 @@ export default function App(){
     var mv=view==="browse"?true:view==="my"?(user&&p.userId===user.uid):view==="favs"?favs.includes(p.id):true;
     var mt=typeFilter==="all"?true:typeFilter==="demand"?p.type==="demand":(p.type||"offer")==="offer";
     var mci=!cityFilter || ((p.location||"").toLowerCase().includes(cityFilter.toLowerCase()));
-    return ms&&mc&&mv&&mt&&mci;
+    // Radius filter — aplikujeme jen pokud máme radius i centrum
+    var mr = true;
+    if(radiusKm && radiusCenter){
+      if(p.lat != null && p.lng != null){
+        // Inzerát má coords → spočítáme vzdálenost
+        var dist = haversineKm(radiusCenter.lat, radiusCenter.lng, p.lat, p.lng);
+        mr = dist <= radiusKm;
+      }
+      // else: inzerát nemá coords → ponecháme (mr zůstane true, ukáže se vždy)
+    }
+    return ms&&mc&&mv&&mt&&mci&&mr;
   });
   if(sort==="oldest")filtered=filtered.slice().reverse();
 
@@ -1775,6 +1793,54 @@ export default function App(){
         </div>
         <div style={{marginBottom:"12px"}}>
           <CityAC value={cityFilter} onChange={setCityFilter} cityList={cityList} placeholder="Filtrovat podle města..." />
+          {/* Radius filter */}
+          {(() => {
+            var centerText = (cityFilter && cityFilter.trim()) || (profile && profile.location) || "";
+            var centerCoords = centerText ? findCityCoords(centerText) : null;
+            var radiusActive = radiusKm != null;
+            var canApply = !!centerCoords;
+            return (
+              <div style={{display:"flex",alignItems:"center",gap:"8px",marginTop:"8px",flexWrap:"wrap"}}>
+                <span style={{fontSize:"12px",color:C.muted,fontWeight:"600"}}>Vzdálenost:</span>
+                {[
+                  {label:"Bez omezení",val:null},
+                  {label:"10 km",val:10},
+                  {label:"25 km",val:25},
+                  {label:"50 km",val:50},
+                  {label:"100 km",val:100}
+                ].map(function(opt){
+                  var active = radiusKm === opt.val;
+                  var disabled = opt.val !== null && !canApply;
+                  return (
+                    <button
+                      key={String(opt.val)}
+                      onClick={function(){ if(!disabled) setRadiusKm(opt.val); }}
+                      disabled={disabled}
+                      title={disabled ? "Pro radius filter zadejte město nahoře nebo si vyplňte město v profilu" : ""}
+                      style={{
+                        padding:"5px 10px",
+                        borderRadius:"14px",
+                        fontSize:"11.5px",
+                        fontWeight:"600",
+                        cursor: disabled ? "not-allowed" : "pointer",
+                        background: active ? C.primary : "white",
+                        color: active ? "white" : (disabled ? C.muted : C.sub),
+                        border: active ? "none" : "1px solid "+C.border,
+                        opacity: disabled ? 0.5 : 1,
+                        boxShadow: active ? "0 2px 6px "+C.primary+"30" : "none"
+                      }}>
+                      {opt.label}
+                    </button>
+                  );
+                })}
+                {radiusActive && centerCoords && (
+                  <span style={{fontSize:"11px",color:C.muted,fontStyle:"italic"}}>
+                    od centra: {centerText.trim() ? centerText : "?"}
+                  </span>
+                )}
+              </div>
+            );
+          })()}
         </div>
 
         <div style={{display:"flex",gap:"6px",overflowX:"auto",paddingBottom:"4px",marginBottom:"16px",WebkitOverflowScrolling:"touch"}}>{CATS.map(function(c){return(<button key={c} onClick={function(){setCat(c);}} style={{padding:"6px 12px",borderRadius:"20px",background:cat===c?C.primary:"white",color:cat===c?"white":C.sub,fontSize:"12px",fontWeight:"600",cursor:"pointer",whiteSpace:"nowrap",border:cat===c?"none":"1px solid "+C.border,boxShadow:cat===c?"0 2px 8px "+C.primary+"30":"none"}}>{c}</button>);})}</div>
@@ -1783,7 +1849,7 @@ export default function App(){
 
       <main style={{maxWidth:"960px",margin:"0 auto",padding:"0 20px 80px"}}>
         {!filtered.length?(
-          <div style={{textAlign:"center",padding:"48px 20px",color:C.muted}}><I.Leaf s={44} c={C.border} /><p style={{fontSize:"15px",fontWeight:"500",marginTop:"12px",color:C.sub}}>{view==="my"?"Zatím nemáte žádné příspěvky":view==="favs"?"Žádné oblíbené":(search||cityFilter||typeFilter!=="all")?"Nic neodpovídá filtrům":"Žádné příspěvky"}</p></div>
+          <div style={{textAlign:"center",padding:"48px 20px",color:C.muted}}><I.Leaf s={44} c={C.border} /><p style={{fontSize:"15px",fontWeight:"500",marginTop:"12px",color:C.sub}}>{view==="my"?"Zatím nemáte žádné příspěvky":view==="favs"?"Žádné oblíbené":(search||cityFilter||typeFilter!=="all"||radiusKm)?"Nic neodpovídá filtrům":"Žádné příspěvky"}</p></div>
         ):(
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill, minmax(270px, 1fr))",gap:"14px"}}>{filtered.map(function(p,i){return(<div key={p.id} style={{animation:"slideUp 0.35s ease "+(i*0.04)+"s both"}}><PlantCard plant={p} onClick={function(){setSel(p);}} isFav={favs.includes(p.id)} onToggleFav={toggleFav} /></div>);})}</div>
         )}

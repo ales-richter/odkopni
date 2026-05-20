@@ -1620,8 +1620,11 @@ export default function App(){
         // Inzerát má coords → spočítáme vzdálenost
         var dist = haversineKm(radiusCenter.lat, radiusCenter.lng, p.lat, p.lng);
         mr = dist <= radiusKm;
+      } else {
+        // Inzerát nemá coords (nerozpoznatelná lokace) → skrýt z radius filtru
+        // Tyto inzeráty se zobrazí jen v režimu "Bez omezení"
+        mr = false;
       }
-      // else: inzerát nemá coords → ponecháme (mr zůstane true, ukáže se vždy)
     }
     return ms&&mc&&mv&&mt&&mci&&mr;
   });

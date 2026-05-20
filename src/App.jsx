@@ -1511,7 +1511,7 @@ export default function App(){
     (async function(){
       try{
         var CACHE_KEY="odkopni_plants_cache";
-        var CACHE_TTL=5*60*1000; // 5 minut
+        var CACHE_TTL=30*60*1000; // 30 minut (sníženo z 5 min — šetří Firestore reads)
         // Nejdřív zkus cache
         try{
           var cached=JSON.parse(localStorage.getItem(CACHE_KEY)||"null");
@@ -1535,7 +1535,7 @@ export default function App(){
     (async function(){
       try{
         var CACHE_KEY="odkopni_profiles_cache";
-        var CACHE_TTL=10*60*1000; // 10 minut
+        var CACHE_TTL=60*60*1000; // 60 minut (sníženo z 10 min — šetří Firestore reads)
         try{
           var cached=JSON.parse(localStorage.getItem(CACHE_KEY)||"null");
           if(cached && cached.ts && (Date.now()-cached.ts)<CACHE_TTL && Array.isArray(cached.data)){
@@ -1568,7 +1568,7 @@ export default function App(){
       }catch(e){}
     }
     checkUnread();
-    var interval=setInterval(checkUnread,60000); // 60s místo 15s
+    var interval=setInterval(checkUnread,5*60*1000); // 5 minut (sníženo z 60s — šetří Firestore reads)
     return function(){clearInterval(interval);};
   },[user]);
 
@@ -1576,6 +1576,32 @@ export default function App(){
 
   // Pomocná funkce — invaliduje plants cache po vlastní změně
   function invalidatePlantsCache(){try{localStorage.removeItem("odkopni_plants_cache");}catch(e){}}
+
+  // ── Refresh on window focus — když uživatel přepne zpět do tabu po delší pauze,
+  //    invaliduje cache a načte čerstvá data. Pomáhá vidět nové inzeráty bez čekání 30 min.
+  useEffect(function(){
+    function handleFocus(){
+      try{
+        var cached = JSON.parse(localStorage.getItem("odkopni_plants_cache")||"null");
+        // Refresh jen pokud cache je starší než 2 minuty (zabraní spam při častém přepínání)
+        if(!cached || !cached.ts || (Date.now() - cached.ts) > 2*60*1000){
+          invalidatePlantsCache();
+          // Async načtení plants
+          (async function(){
+            try{
+              var q2=query(collection(db,"plants"),orderBy("createdAt","desc"));
+              var snap=await getDocs(q2);
+              var data=snap.docs.map(function(d){return Object.assign({id:d.id},d.data());});
+              setPlants(data);
+              try{localStorage.setItem("odkopni_plants_cache",JSON.stringify({ts:Date.now(),data:data}));}catch(e){}
+            }catch(e){}
+          })();
+        }
+      }catch(e){}
+    }
+    window.addEventListener("focus", handleFocus);
+    return function(){window.removeEventListener("focus", handleFocus);};
+  },[]);
 
   function toggleFav(id){setFavs(function(f){return f.includes(id)?f.filter(function(x){return x!==id;}):f.concat([id]);});}
   function addPlant(p){setPlants(function(prev){return[p].concat(prev);});invalidatePlantsCache();}
